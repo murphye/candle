@@ -68,6 +68,7 @@ extern "C" {
     pub fn hipEventRecord(event: hipEvent_t, stream: hipStream_t) -> hipError_t;
     pub fn hipEventSynchronize(event: hipEvent_t) -> hipError_t;
     pub fn hipEventDestroy(event: hipEvent_t) -> hipError_t;
+    pub fn hipEventQuery(event: hipEvent_t) -> hipError_t;
 
     pub fn hipDeviceGetDefaultMemPool(pool: *mut hipMemPool_t, device: c_int) -> hipError_t;
     pub fn hipMemPoolSetAttribute(

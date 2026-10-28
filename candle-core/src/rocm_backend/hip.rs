@@ -273,6 +273,11 @@ fn cached_block_bytes(bytes: usize) -> usize {
 struct BlockCache {
     free: std::collections::HashMap<usize, Vec<u64>>,
     total_bytes: usize,
+    /// Blocks that another device's stream may still read (peer copies), keyed by
+    /// pointer: the events that must complete before the block can be reused.
+    guards: std::collections::HashMap<u64, Vec<sys::hipEvent_t>>,
+    /// Released guarded blocks waiting for their events: (ptr, block bytes, events).
+    pending: Vec<(u64, usize, Vec<sys::hipEvent_t>)>,
 }
 
 /// A stream on a given device. All candle work for a device is ordered on one.
@@ -436,6 +441,9 @@ impl HipStream {
 
     fn take_cached(&self, block: usize) -> u64 {
         let mut cache = self.cache.lock().unwrap();
+        if !cache.pending.is_empty() {
+            Self::reap_pending(&mut cache);
+        }
         match cache.free.get_mut(&block).and_then(Vec::pop) {
             Some(ptr) => {
                 cache.total_bytes -= block;
@@ -445,10 +453,55 @@ impl HipStream {
         }
     }
 
+    /// Moves pending blocks whose guarding events have completed to the free lists.
+    fn reap_pending(cache: &mut BlockCache) {
+        let mut i = 0;
+        while i < cache.pending.len() {
+            let done = cache.pending[i]
+                .2
+                .iter()
+                .all(|&e| unsafe { sys::hipEventQuery(e) } == sys::hipSuccess);
+            if done {
+                let (ptr, block, events) = cache.pending.swap_remove(i);
+                for e in events {
+                    unsafe { sys::hipEventDestroy(e) };
+                }
+                cache.total_bytes += block;
+                cache.free.entry(block).or_default().push(ptr);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Keeps `ptr` out of reuse until `event` (recorded on another stream that reads
+    /// it) has completed, without making this stream wait for that stream.
+    pub(crate) fn guard_until(&self, ptr: u64, event: sys::hipEvent_t) {
+        self.cache.lock().unwrap().guards.entry(ptr).or_default().push(event);
+    }
+
+    /// Releases an uncached block: stream-ordered free, after any guarding events.
+    fn release_uncached(&self, ptr: u64) {
+        let events = self.cache.lock().unwrap().guards.remove(&ptr);
+        if self.bind().is_ok() {
+            for e in events.into_iter().flatten() {
+                unsafe {
+                    sys::hipStreamWaitEvent(self.raw, e, 0);
+                    sys::hipEventDestroy(e);
+                }
+            }
+            unsafe { sys::hipFreeAsync(ptr as *mut c_void, self.raw) };
+        }
+    }
+
     /// Returns a block to the cache, or frees it when the cache is full.
     fn release(&self, ptr: u64, block: usize) {
         {
             let mut cache = self.cache.lock().unwrap();
+            if let Some(events) = cache.guards.remove(&ptr) {
+                cache.pending.push((ptr, block, events));
+                return;
+            }
             if cache.total_bytes + block <= CACHE_MAX_TOTAL_BYTES {
                 cache.total_bytes += block;
                 cache.free.entry(block).or_default().push(ptr);
@@ -464,6 +517,16 @@ impl HipStream {
     pub fn release_cached(&self) -> Result<(), HipError> {
         let blocks: Vec<u64> = {
             let mut cache = self.cache.lock().unwrap();
+            // Pending blocks are freed too once their readers are done.
+            for (ptr, _, events) in std::mem::take(&mut cache.pending) {
+                for e in events {
+                    unsafe {
+                        sys::hipEventSynchronize(e);
+                        sys::hipEventDestroy(e);
+                    }
+                }
+                cache.free.entry(0).or_default().push(ptr);
+            }
             cache.total_bytes = 0;
             cache.free.drain().flat_map(|(_, ptrs)| ptrs).collect()
         };
@@ -675,9 +738,7 @@ impl HipStream {
         if src.stream.ordinal == self.ordinal {
             self.memcpy_dtod(src, &mut dst)?;
         } else {
-            // Writes to src are ordered on its own stream: this stream waits for
-            // them, and src's stream waits for the copy before src can be reused.
-            // Neither wait blocks the host.
+            // Writes to src are ordered on its own stream: this stream waits for them.
             src.stream.order_before(self)?;
             self.bind()?;
             check(unsafe {
@@ -690,7 +751,13 @@ impl HipStream {
                     self.raw,
                 )
             })?;
-            self.order_before(&src.stream)?;
+            // Instead of making src's stream wait for this one (and with it for
+            // everything queued here before the copy), keep src's block out of
+            // reuse until the copy has run. The source device can then run ahead.
+            let mut event = std::ptr::null_mut();
+            check(unsafe { sys::hipEventCreateWithFlags(&mut event, sys::hipEventDisableTiming) })?;
+            check(unsafe { sys::hipEventRecord(event, self.raw) })?;
+            src.stream.guard_until(src.ptr, event);
         }
         // Leave this stream's device current: raw kernel launchers rely on it.
         self.bind()?;
@@ -759,8 +826,8 @@ impl<T> Drop for HipSlice<T> {
         if self.cached {
             let bytes = self.len * std::mem::size_of::<T>();
             self.stream.release(self.ptr, cached_block_bytes(bytes));
-        } else if self.stream.bind().is_ok() {
-            unsafe { sys::hipFreeAsync(self.ptr as *mut c_void, self.stream.raw) };
+        } else {
+            self.stream.release_uncached(self.ptr);
         }
     }
 }
