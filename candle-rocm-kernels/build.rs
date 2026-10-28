@@ -21,6 +21,7 @@ const MODULES: &[(&str, &str)] = &[
     ("CONV", "candle-kernels/conv.cu"),
     ("FILL", "candle-kernels/fill.cu"),
     ("INDEXING", "candle-kernels/indexing.cu"),
+    ("QUANTIZED", "candle-kernels/quantized.cu"),
     ("REDUCE", "candle-kernels/reduce.cu"),
     ("SORT", "candle-kernels/sort.cu"),
     ("TERNARY", "candle-kernels/ternary.cu"),

@@ -21,7 +21,7 @@ fn test_matmul(
     (b, m, n, k): (usize, usize, usize, usize),
     dtype: GgmlDType,
 ) -> Result<()> {
-    if (device.is_cuda() || device.is_metal())
+    if (device.is_cuda() || device.is_metal() || device.is_rocm())
         && (dtype == GgmlDType::Q8_1 || dtype == GgmlDType::Q8K)
     {
         return Ok(());
@@ -128,9 +128,7 @@ fn quantized_matmul(device: &Device) -> Result<()> {
                 [341970.0, 994574.0, 1656181.0, 2302182.0]
             ]
         ),
-        // Quantized matmul is not yet implemented on rocm.
-        Device::Rocm(_) => {}
-        Device::Cuda(_) => assert_eq!(
+        Device::Cuda(_) | Device::Rocm(_) => assert_eq!(
             to_vec2_round(&res, 0)?,
             &[
                 [84866.0, 214045.0, 344676.0, 473707.0],
@@ -194,9 +192,7 @@ fn quantized_matmul_neg(device: &Device) -> Result<()> {
                 [-196101.0, 63021.0, 324252.0, 587137.0]
             ]
         ),
-        // Quantized matmul is not yet implemented on rocm.
-        Device::Rocm(_) => {}
-        Device::Cuda(_) => assert_eq!(
+        Device::Cuda(_) | Device::Rocm(_) => assert_eq!(
             to_vec2_round(&res, 0)?,
             &[
                 [243740.0, -19762.0, -285476.0, -550498.0],
@@ -217,7 +213,7 @@ fn quantized_matmul_neg(device: &Device) -> Result<()> {
     let res2 = matmul.forward(&lhs2)?;
     let res2 = res2.i(1)?;
     let diff = (&res - res2)?.abs()?.mean_all()?.to_vec0::<f32>()? / res.elem_count() as f32;
-    if device.is_cuda() {
+    if device.is_cuda() || device.is_rocm() {
         assert!(diff < 0.1);
     } else {
         assert!(diff < 0.96);
@@ -247,8 +243,8 @@ fn qmm_batch(dev: &Device) -> Result<()> {
     let mm4 = rhs.forward(&lhs4)?;
     assert_eq!(mm4.shape().dims(), [12, 6]);
     let diff4 = (mm4.i(..6)? - &mm3)?.abs()?.sum_all()?.to_vec0::<f32>()?;
-    if dev.is_cuda() {
-        // We use different fused kernels (MMVQ for batch<=8, MMQ for batch>8) on CUDA which accumulate differently than dequantize-then-matmul.
+    if dev.is_cuda() || dev.is_rocm() {
+        // We use different fused kernels (MMVQ for batch<=8, MMQ for batch>8) on CUDA/ROCm which accumulate differently than dequantize-then-matmul.
         // This can lead to small numerical differences especially for low-bit quants.
         assert!(0. < diff4 && diff4 < 0.5)
     } else {

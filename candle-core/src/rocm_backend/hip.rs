@@ -539,6 +539,14 @@ impl<T: DeviceRepr> HipSlice<T> {
     }
 }
 
+/// Copies the buffer on its stream. Panics if the device allocation fails, like
+/// cudarc's `CudaSlice`; use `try_clone` to handle the error.
+impl<T: DeviceRepr> Clone for HipSlice<T> {
+    fn clone(&self) -> Self {
+        self.try_clone().expect("failed to clone device buffer")
+    }
+}
+
 impl<T> DevicePtr<T> for HipSlice<T> {
     fn device_ptr(&self) -> u64 {
         self.ptr

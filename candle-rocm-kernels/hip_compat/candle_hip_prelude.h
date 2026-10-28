@@ -29,6 +29,34 @@ __device__ __forceinline__ __hip_bfloat16 __hmin_nan(__hip_bfloat16 a, __hip_bfl
     return isnan(fa) ? a : (isnan(fb) ? b : (fa < fb ? a : b));
 }
 
+// SIMD-in-register integer ops used by the quantized kernels, mapped onto the
+// AMD dot product instructions as in llama.cpp's HIP backend.
+typedef int8_t candle_int8x4_t __attribute__((ext_vector_type(4)));
+
+__device__ __forceinline__ int __dp4a(const int a, const int b, int c) {
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) \
+    || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__) \
+    || defined(__gfx1200__) || defined(__gfx1201__)
+    return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
+#elif defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx942__) \
+    || defined(__gfx950__) || defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) \
+    || defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__)
+    return __builtin_amdgcn_sdot4(a, b, c, false);
+#else
+    const candle_int8x4_t va = __builtin_bit_cast(candle_int8x4_t, a);
+    const candle_int8x4_t vb = __builtin_bit_cast(candle_int8x4_t, b);
+    return c + va[0] * vb[0] + va[1] * vb[1] + va[2] * vb[2] + va[3] * vb[3];
+#endif
+}
+
+// Per-byte saturating subtraction of packed signed 8-bit values.
+__device__ __forceinline__ int __vsubss4(const int a, const int b) {
+    const candle_int8x4_t va = __builtin_bit_cast(candle_int8x4_t, a);
+    const candle_int8x4_t vb = __builtin_bit_cast(candle_int8x4_t, b);
+    const candle_int8x4_t c = __builtin_elementwise_sub_sat(va, vb);
+    return __builtin_bit_cast(int, c);
+}
+
 // Warp shuffles: the kernels pass 32-bit full masks, which HIP's *_sync
 // builtins reject. Every reduction uses xor offsets below 32, so it stays inside
 // 32-lane groups and is also correct on wave64 targets.
