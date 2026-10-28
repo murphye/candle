@@ -1120,28 +1120,48 @@ impl QRocmStorage {
             _ => return Ok(None),
         };
 
-        // Quantize the activations to q8_1, padded to MATRIX_ROW_PADDING.
+        // Quantize the activations to q8_1, padded to MATRIX_ROW_PADDING. Projections of the
+        // same activations back to back (q/k/v, gate/up) reuse the previous quantization.
         let k_padded = pad(k, MATRIX_ROW_PADDING);
-        let row_bytes = k_padded / GgmlDType::Q8_1.block_size() * GgmlDType::Q8_1.type_size();
-        let y_q8_1 = unsafe { dev.alloc::<u8>(b_size * row_bytes)? };
-        let func = dev.get_or_load_func(
-            &format!("mmvq_gguf_quantize_q8_1_{dst_tag}"),
-            &kernels::MMVQ,
-        )?;
-        let cfg = LaunchConfig {
-            grid_dim: (
-                ceil_div(k_padded, CUDA_QUANTIZE_BLOCK_SIZE) as u32,
-                b_size as u32,
-                1,
-            ),
-            block_dim: (CUDA_QUANTIZE_BLOCK_SIZE as u32, 1, 1),
-            shared_mem_bytes: 0,
+        let stream = dev.hip_stream();
+        let dtype_code = match dst_tag {
+            "bf16" => 0,
+            "f16" => 1,
+            _ => 2,
         };
-        let mut builder = func.builder();
-        builder.arg(&rhs_ptr);
-        builder.arg(&y_q8_1);
-        barg!(builder, k as i32, k_padded as i32);
-        unsafe { builder.launch(cfg) }.w()?;
+        let q8_key = (rhs_ptr, k, b_size * 4 + dtype_code);
+        let (y_q8_1, fresh_q8_1) = match stream.derived(q8_key) {
+            Some(ptr) => (ptr, None),
+            None => {
+                let row_bytes =
+                    k_padded / GgmlDType::Q8_1.block_size() * GgmlDType::Q8_1.type_size();
+                let y = unsafe { dev.alloc::<u8>(b_size * row_bytes)? };
+                let func = dev.get_or_load_func(
+                    &format!("mmvq_gguf_quantize_q8_1_{dst_tag}"),
+                    &kernels::MMVQ,
+                )?;
+                let cfg = LaunchConfig {
+                    grid_dim: (
+                        ceil_div(k_padded, CUDA_QUANTIZE_BLOCK_SIZE) as u32,
+                        b_size as u32,
+                        1,
+                    ),
+                    block_dim: (CUDA_QUANTIZE_BLOCK_SIZE as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut builder = func.builder();
+                builder.arg(&rhs_ptr);
+                builder.arg(&y);
+                barg!(builder, k as i32, k_padded as i32);
+                unsafe { builder.launch(cfg) }.w()?;
+                (y.device_ptr(), Some(y))
+            }
+        };
+        // Only this matmul's own output was written since the quantization.
+        let keep_q8_1 = move || match fresh_q8_1 {
+            Some(y) => stream.set_derived(q8_key, y),
+            None => stream.renew_derived(),
+        };
 
         // Same launch shape as the CUDA launcher: two rows per block past batch 1.
         let weights = &self.data.inner;
@@ -1173,6 +1193,7 @@ impl QRocmStorage {
             builder.arg(&out_ptr);
             barg!(builder, k as i32, nrows as i32);
             unsafe { builder.launch(cfg) }.w()?;
+            keep_q8_1();
             let mut out_shape = rhs_l.shape().dims().to_vec();
             out_shape.pop();
             out_shape.push(nrows);
@@ -1202,6 +1223,7 @@ impl QRocmStorage {
         builder.arg(&out_ptr);
         barg!(builder, k as i32, nrows as i32, stride_col_y, nrows as i32);
         unsafe { builder.launch(cfg) }.w()?;
+        keep_q8_1();
 
         let mut out_shape = rhs_l.shape().dims().to_vec();
         out_shape.pop();

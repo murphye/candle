@@ -130,3 +130,41 @@ fn indexed_moe_glu_matches_separate_projections() -> Result<()> {
     }
     Ok(())
 }
+
+/// Back-to-back projections of one activation reuse its q8_1 quantization; any write
+/// to the stream in between (an in-place update or a new tensor in a recycled buffer)
+/// must force a fresh one.
+#[test]
+fn reused_activation_quantization_tracks_writes() -> Result<()> {
+    let rocm = Device::new_rocm(0)?;
+    let k = 256;
+    let weights = [(64, 1.0), (32, -2.0), (48, 0.5)].map(|(n, scale)| {
+        let w = (Tensor::randn(0f32, 1.0, (n, k), &Device::Cpu).unwrap() * scale).unwrap();
+        let cpu = QMatMul::from_qtensor(QTensor::quantize(&w, GgmlDType::Q8_0).unwrap()).unwrap();
+        let gpu = QMatMul::from_qtensor(
+            QTensor::quantize(&w.to_device(&rocm).unwrap(), GgmlDType::Q8_0).unwrap(),
+        )
+        .unwrap();
+        (cpu, gpu)
+    });
+    let check = |x: &Tensor| -> Result<()> {
+        let host = x.to_device(&Device::Cpu)?;
+        for (cpu, gpu) in &weights {
+            let diff = max_rel_diff(&cpu.forward(&host)?, &gpu.forward(x)?)?;
+            assert!(diff < 0.05, "relative diff {diff}");
+        }
+        Ok(())
+    };
+
+    let x = Tensor::randn(0f32, 1.0, (1, k), &rocm)?;
+    check(&x)?;
+    // Overwrite the same buffer in place.
+    x.slice_set(&Tensor::randn(0f32, 1.0, (1, k), &rocm)?, 0, 0)?;
+    check(&x)?;
+    // Fresh tensors of the same size, likely landing in the dropped buffers.
+    for _ in 0..4 {
+        let x = Tensor::randn(0f32, 1.0, (1, k), &rocm)?;
+        check(&x)?;
+    }
+    Ok(())
+}

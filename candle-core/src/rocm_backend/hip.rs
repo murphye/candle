@@ -282,6 +282,22 @@ pub struct HipStream {
     ordinal: usize,
     staging: std::sync::Mutex<Option<Staging>>,
     cache: std::sync::Mutex<BlockCache>,
+    /// Counts the operations that may write device memory: allocations, copies,
+    /// launches and every hand-out of the raw stream to foreign code.
+    epoch: std::sync::atomic::AtomicU64,
+    derived: std::sync::Mutex<Option<Derived>>,
+}
+
+/// A buffer computed from another buffer (e.g. activations quantized for a
+/// quantized matmul), reusable while the stream's epoch is unchanged.
+/// The buffer is held as a raw allocation: a `HipSlice` would keep its stream alive.
+#[derive(Debug)]
+struct Derived {
+    epoch: u64,
+    key: (u64, usize, usize),
+    ptr: u64,
+    bytes: usize,
+    cached: bool,
 }
 
 // SAFETY: HIP streams may be used from any thread once created.
@@ -303,11 +319,69 @@ impl HipStream {
             ordinal,
             staging: std::sync::Mutex::new(Some(staging)),
             cache: std::sync::Mutex::new(BlockCache::default()),
+            epoch: std::sync::atomic::AtomicU64::new(0),
+            derived: std::sync::Mutex::new(None),
         }))
     }
 
+    /// The raw stream. Callers may enqueue anything on it, so this counts as a write.
     pub fn raw(&self) -> sys::hipStream_t {
+        self.touch();
         self.raw
+    }
+
+    fn touch(&self) {
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Device address of the buffer derived from `key` by the last call to
+    /// [`Self::set_derived`], if nothing has been allocated, copied or launched
+    /// on this stream since then.
+    pub fn derived(&self, key: (u64, usize, usize)) -> Option<u64> {
+        let derived = self.derived.lock().unwrap();
+        derived
+            .as_ref()
+            .filter(|d| d.key == key && d.epoch == self.epoch())
+            .map(|d| d.ptr)
+    }
+
+    /// Remembers `data` as derived from `key`, valid until the next write to the stream.
+    /// Call it after enqueuing the work that reads `data`.
+    pub fn set_derived(&self, key: (u64, usize, usize), data: HipSlice<u8>) {
+        let data = std::mem::ManuallyDrop::new(data);
+        // SAFETY: the stream handle is read out once and dropped; `data` is never used again.
+        drop(unsafe { std::ptr::read(&data.stream) });
+        let new = Derived {
+            epoch: self.epoch(),
+            key,
+            ptr: data.ptr,
+            bytes: data.len,
+            cached: data.cached,
+        };
+        let old = self.derived.lock().unwrap().replace(new);
+        if let Some(old) = old {
+            self.free_derived(old);
+        }
+    }
+
+    fn free_derived(&self, d: Derived) {
+        if d.cached {
+            self.release(d.ptr, cached_block_bytes(d.bytes));
+        } else if self.bind().is_ok() {
+            unsafe { sys::hipFreeAsync(d.ptr as *mut c_void, self.raw) };
+        }
+    }
+
+    /// Extends the derived buffer's validity over the writes made since it was set;
+    /// the caller vouches that none of them touched the source buffer.
+    pub fn renew_derived(&self) {
+        if let Some(d) = self.derived.lock().unwrap().as_mut() {
+            d.epoch = self.epoch();
+        }
     }
 
     pub fn ordinal(&self) -> usize {
@@ -335,6 +409,7 @@ impl HipStream {
         self: &Arc<Self>,
         len: usize,
     ) -> Result<HipSlice<T>, HipError> {
+        self.touch();
         let bytes = len * std::mem::size_of::<T>();
         let mut ptr = 0;
         let mut cached = false;
@@ -451,6 +526,7 @@ impl HipStream {
             return Ok(());
         }
         self.bind()?;
+        self.touch();
         check(unsafe { sys::hipMemsetAsync(dst.device_ptr() as *mut c_void, 0, bytes, self.raw) })
     }
 
@@ -468,6 +544,7 @@ impl HipStream {
         src: &[T],
         dst: &mut Dst,
     ) -> Result<(), HipError> {
+        self.touch();
         assert!(dst.len() >= src.len(), "memcpy_htod: destination too small");
         let bytes = std::mem::size_of_val(src);
         if bytes == 0 {
@@ -563,6 +640,7 @@ impl HipStream {
         src: &Src,
         dst: &mut Dst,
     ) -> Result<(), HipError> {
+        self.touch();
         assert!(dst.len() >= src.len(), "memcpy_dtod: destination too small");
         let bytes = src.len() * std::mem::size_of::<T>();
         if bytes == 0 {
@@ -620,6 +698,9 @@ impl HipStream {
 impl Drop for HipStream {
     fn drop(&mut self) {
         if bind_device(self.ordinal).is_ok() {
+            if let Some(d) = self.derived.get_mut().ok().and_then(Option::take) {
+                self.free_derived(d);
+            }
             let _ = self.release_cached();
             unsafe {
                 sys::hipStreamSynchronize(self.raw);
@@ -1001,6 +1082,7 @@ impl<'a> LaunchArgs<'a> {
         }
         let (bx, by, bz) = cfg.block_dim;
         self.stream.bind()?;
+        self.stream.touch();
         check(sys::hipModuleLaunchKernel(
             self.func.raw,
             gx,
