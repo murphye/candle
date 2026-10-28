@@ -3,7 +3,9 @@
 //!
 //! All work for a device is submitted on a single non-blocking stream.
 //! Allocations are stream ordered (`hipMallocAsync`/`hipFreeAsync`), so
-//! dropping a buffer never synchronizes the device.
+//! dropping a buffer never synchronizes the device. Small freed buffers are
+//! kept in a per-stream cache and handed out again by later allocations, which
+//! is safe because every user of a buffer is ordered on that same stream.
 pub use candle_rocm_kernels::ffi as sys;
 use std::ffi::{c_void, CStr, CString};
 use std::marker::PhantomData;
@@ -231,12 +233,36 @@ impl Staging {
     }
 }
 
+/// Largest allocation kept in the free-buffer cache. `hipFreeAsync` costs about
+/// 5us of host time, more than a kernel launch, which dominates small ops.
+const CACHE_MAX_BLOCK_BYTES: usize = 64 << 20;
+/// Upper bound on the bytes held by the cache of one stream.
+const CACHE_MAX_TOTAL_BYTES: usize = 2 << 30;
+
+/// The bytes actually allocated for a request: 512 byte granularity for small
+/// blocks, then four size classes per power of two (at most 25% slack).
+fn cached_block_bytes(bytes: usize) -> usize {
+    if bytes <= 4096 {
+        return bytes.div_ceil(512) * 512;
+    }
+    let step = (bytes.next_power_of_two() / 8).max(512);
+    bytes.div_ceil(step) * step
+}
+
+/// Freed device buffers by block size, reused in stream order.
+#[derive(Debug, Default)]
+struct BlockCache {
+    free: std::collections::HashMap<usize, Vec<u64>>,
+    total_bytes: usize,
+}
+
 /// A stream on a given device. All candle work for a device is ordered on one.
 #[derive(Debug)]
 pub struct HipStream {
     raw: sys::hipStream_t,
     ordinal: usize,
     staging: std::sync::Mutex<Option<Staging>>,
+    cache: std::sync::Mutex<BlockCache>,
 }
 
 // SAFETY: HIP streams may be used from any thread once created.
@@ -257,6 +283,7 @@ impl HipStream {
             raw,
             ordinal,
             staging: std::sync::Mutex::new(Some(staging)),
+            cache: std::sync::Mutex::new(BlockCache::default()),
         }))
     }
 
@@ -290,17 +317,86 @@ impl HipStream {
         len: usize,
     ) -> Result<HipSlice<T>, HipError> {
         let bytes = len * std::mem::size_of::<T>();
-        let mut ptr = std::ptr::null_mut();
+        let mut ptr = 0;
+        let mut cached = false;
         if bytes > 0 {
-            self.bind()?;
-            check(sys::hipMallocAsync(&mut ptr, bytes, self.raw))?;
+            if bytes <= CACHE_MAX_BLOCK_BYTES {
+                let block = cached_block_bytes(bytes);
+                ptr = self.take_cached(block);
+                if ptr == 0 {
+                    ptr = self.malloc(block)?;
+                }
+                cached = true;
+            } else {
+                ptr = self.malloc(bytes)?;
+            }
         }
         Ok(HipSlice {
-            ptr: ptr as u64,
+            ptr,
             len,
+            cached,
             stream: self.clone(),
             marker: PhantomData,
         })
+    }
+
+    fn take_cached(&self, block: usize) -> u64 {
+        let mut cache = self.cache.lock().unwrap();
+        match cache.free.get_mut(&block).and_then(Vec::pop) {
+            Some(ptr) => {
+                cache.total_bytes -= block;
+                ptr
+            }
+            None => 0,
+        }
+    }
+
+    /// Returns a block to the cache, or frees it when the cache is full.
+    fn release(&self, ptr: u64, block: usize) {
+        {
+            let mut cache = self.cache.lock().unwrap();
+            if cache.total_bytes + block <= CACHE_MAX_TOTAL_BYTES {
+                cache.total_bytes += block;
+                cache.free.entry(block).or_default().push(ptr);
+                return;
+            }
+        }
+        if self.bind().is_ok() {
+            unsafe { sys::hipFreeAsync(ptr as *mut c_void, self.raw) };
+        }
+    }
+
+    /// Frees every cached block back to the memory pool.
+    pub fn release_cached(&self) -> Result<(), HipError> {
+        let blocks: Vec<u64> = {
+            let mut cache = self.cache.lock().unwrap();
+            cache.total_bytes = 0;
+            cache.free.drain().flat_map(|(_, ptrs)| ptrs).collect()
+        };
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        self.bind()?;
+        for ptr in blocks {
+            check(unsafe { sys::hipFreeAsync(ptr as *mut c_void, self.raw) })?;
+        }
+        Ok(())
+    }
+
+    /// `hipMallocAsync`, retrying once with the cache emptied when out of memory.
+    fn malloc(&self, bytes: usize) -> Result<u64, HipError> {
+        self.bind()?;
+        let mut ptr = std::ptr::null_mut();
+        let status = unsafe { sys::hipMallocAsync(&mut ptr, bytes, self.raw) };
+        if status == sys::hipErrorOutOfMemory {
+            self.release_cached()?;
+            // The pool only reuses freed memory once the frees have executed.
+            self.synchronize()?;
+            check(unsafe { sys::hipMallocAsync(&mut ptr, bytes, self.raw) })?;
+        } else {
+            check(status)?;
+        }
+        Ok(ptr as u64)
     }
 
     pub fn alloc_zeros<T: DeviceRepr + ValidAsZeroBits>(
@@ -477,6 +573,15 @@ impl HipStream {
                     self.raw,
                 )
             })?;
+            // The copy reads src on this stream: order src's later reuse on its
+            // own stream after it.
+            let mut event = std::ptr::null_mut();
+            check(unsafe { sys::hipEventCreateWithFlags(&mut event, sys::hipEventDisableTiming) })?;
+            check(unsafe { sys::hipEventRecord(event, self.raw) })?;
+            src.stream.bind()?;
+            check(unsafe { sys::hipStreamWaitEvent(src.stream.raw, event, 0) })?;
+            check(unsafe { sys::hipEventDestroy(event) })?;
+            self.bind()?;
         }
         Ok(dst)
     }
@@ -485,6 +590,7 @@ impl HipStream {
 impl Drop for HipStream {
     fn drop(&mut self) {
         if bind_device(self.ordinal).is_ok() {
+            let _ = self.release_cached();
             unsafe {
                 sys::hipStreamSynchronize(self.raw);
                 if let Some(staging) = self.staging.get_mut().ok().and_then(Option::take) {
@@ -515,6 +621,8 @@ pub trait DevicePtrMut<T>: DevicePtr<T> {}
 pub struct HipSlice<T> {
     ptr: u64,
     len: usize,
+    /// Allocated through the stream's block cache, with `cached_block_bytes` bytes.
+    cached: bool,
     stream: Arc<HipStream>,
     marker: PhantomData<*const T>,
 }
@@ -531,7 +639,13 @@ impl<T> std::fmt::Debug for HipSlice<T> {
 
 impl<T> Drop for HipSlice<T> {
     fn drop(&mut self) {
-        if self.ptr != 0 && self.stream.bind().is_ok() {
+        if self.ptr == 0 {
+            return;
+        }
+        if self.cached {
+            let bytes = self.len * std::mem::size_of::<T>();
+            self.stream.release(self.ptr, cached_block_bytes(bytes));
+        } else if self.stream.bind().is_ok() {
             unsafe { sys::hipFreeAsync(self.ptr as *mut c_void, self.stream.raw) };
         }
     }
@@ -607,6 +721,7 @@ impl<T> HipSlice<T> {
         Self {
             ptr,
             len,
+            cached: false,
             stream,
             marker: PhantomData,
         }
