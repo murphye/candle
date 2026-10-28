@@ -495,7 +495,7 @@ fn try_gemv<T: DeviceRepr + ValidAsZeroBits>(
     let out = unsafe { dev.alloc::<T>(rows * n)? };
     let func = dev.get_or_load_func(kname, &kernels::GEMV)?;
     let cfg = LaunchConfig {
-        grid_dim: ((n as u32).div_ceil(GEMV_WARPS), 1, 1),
+        grid_dim: (n as u32, 1, 1),
         block_dim: (32, GEMV_WARPS, 1),
         shared_mem_bytes: 0,
     };

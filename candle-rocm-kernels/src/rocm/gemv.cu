@@ -1,6 +1,6 @@
 // Matrix-vector products for decode-shaped matmuls: `y[m, n] = x[m, k] . w[n, k]^T`
-// with a handful of rows `m`. One 32-lane warp computes one output column for every
-// row, streaming its weight row once with 16-byte loads. The BLAS libraries pick
+// with a handful of rows `m`. One block computes one output column for every row,
+// streaming its weight row once with 16-byte loads. The BLAS libraries pick
 // tiles that are far too large for these shapes and cost several microseconds of
 // host time per call.
 #include "cuda_bf16.h"
@@ -23,16 +23,19 @@ template <> __device__ __forceinline__ __nv_bfloat16 gemv_from_float<__nv_bfloat
 }
 
 // `VEC` elements make one 16-byte load; the host only picks this kernel when `k` is a
-// multiple of `VEC` and every row starts 16-byte aligned.
+// multiple of `VEC` and every row starts 16-byte aligned. The `blockDim.y` warps of a
+// block split one column's `k` between them, which keeps short and narrow products
+// (a 288-expert router, a single gate logit) from being latency bound.
 template <typename T>
-__device__ __forceinline__ void gemv_vec_kernel(const T *__restrict__ w, const T *__restrict__ x, T *__restrict__ y,
-                                const int n, const int k, const int m) {
+__device__ __forceinline__ void gemv_vec_kernel(const T *__restrict__ w, const T *__restrict__ x,
+                                                T *__restrict__ y, const int n, const int k,
+                                                const int m) {
   constexpr int VEC = 16 / sizeof(T);
-  const int col = blockIdx.x * blockDim.y + threadIdx.y;
-  if (col >= n) {
-    return;
-  }
+  __shared__ float partial[GEMV_MAX_ROWS][32];
+  const int col = blockIdx.x;
   const int lane = threadIdx.x;
+  const int warp = threadIdx.y;
+  const int nwarps = blockDim.y;
   const uint4 *wrow = reinterpret_cast<const uint4 *>(w + (int64_t)col * k);
   const int kv = k / VEC;
 
@@ -41,7 +44,7 @@ __device__ __forceinline__ void gemv_vec_kernel(const T *__restrict__ w, const T
   for (int r = 0; r < GEMV_MAX_ROWS; ++r) {
     acc[r] = 0.0f;
   }
-  for (int i = lane; i < kv; i += GEMV_LANES) {
+  for (int i = warp * GEMV_LANES + lane; i < kv; i += nwarps * GEMV_LANES) {
     const uint4 wv = wrow[i];
     const T *wp = reinterpret_cast<const T *>(&wv);
     float wf[VEC];
@@ -70,9 +73,17 @@ __device__ __forceinline__ void gemv_vec_kernel(const T *__restrict__ w, const T
         v += __shfl_xor_sync(0xffffffff, v, offset, GEMV_LANES);
       }
       if (lane == 0) {
-        y[(int64_t)r * n + col] = gemv_from_float<T>(v);
+        partial[r][warp] = v;
       }
     }
+  }
+  __syncthreads();
+  if (warp == 0 && lane < m) {
+    float v = 0.0f;
+    for (int i = 0; i < nwarps; ++i) {
+      v += partial[lane][i];
+    }
+    y[(int64_t)lane * n + col] = gemv_from_float<T>(v);
   }
 }
 
