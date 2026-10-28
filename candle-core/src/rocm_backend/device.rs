@@ -33,6 +33,8 @@ struct RngState {
 
 pub struct ModuleStore {
     mdls: [Option<Arc<HipModule>>; kernels::ALL_IDS.len()],
+    /// Functions already looked up, per module, so a launch skips hipModuleGetFunction.
+    funcs: [HashMap<String, HipFunction>; kernels::ALL_IDS.len()],
 }
 
 #[derive(Clone)]
@@ -177,23 +179,29 @@ impl RocmDevice {
     }
 
     pub fn get_or_load_func(&self, fn_name: &str, mdl: &kernels::Module) -> Result<RocmFunc> {
-        let ms = self.modules.read().unwrap();
-        if let Some(mdl) = ms.mdls[mdl.index()].as_ref() {
-            let func = mdl.load_function(fn_name).w()?;
+        let index = mdl.index();
+        if let Some(func) = self.modules.read().unwrap().funcs[index].get(fn_name) {
             return Ok(RocmFunc {
-                func,
+                func: func.clone(),
                 stream: self.stream.clone(),
             });
         }
-        drop(ms);
         let mut ms = self.modules.write().unwrap();
-        let module =
-            HipModule::load_data(self.ordinal, mdl.code()).map_err(|hip| RocmError::Load {
-                hip,
-                module_name: format!("{:?}", kernels::ALL_IDS[mdl.index()]),
-            })?;
-        ms.mdls[mdl.index()] = Some(module.clone());
+        let module = match ms.mdls[index].as_ref() {
+            Some(module) => module.clone(),
+            None => {
+                let module = HipModule::load_data(self.ordinal, mdl.code()).map_err(|hip| {
+                    RocmError::Load {
+                        hip,
+                        module_name: format!("{:?}", kernels::ALL_IDS[index]),
+                    }
+                })?;
+                ms.mdls[index] = Some(module.clone());
+                module
+            }
+        };
         let func = module.load_function(fn_name).w()?;
+        ms.funcs[index].insert(fn_name.to_string(), func.clone());
         Ok(RocmFunc {
             func,
             stream: self.stream.clone(),
@@ -260,6 +268,7 @@ impl BackendDevice for RocmDevice {
         let blas = RocBlas::new(stream.clone()).w()?;
         let module_store = ModuleStore {
             mdls: [const { None }; kernels::ALL_IDS.len()],
+            funcs: std::array::from_fn(|_| HashMap::new()),
         };
         Ok(Self {
             id: DeviceId::new(),
