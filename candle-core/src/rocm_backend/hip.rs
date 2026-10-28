@@ -502,6 +502,9 @@ impl HipStream {
             // The pool only reuses freed memory once the frees have executed.
             self.synchronize()?;
             check(unsafe { sys::hipMallocAsync(&mut ptr, bytes, self.raw) })?;
+            // The failed attempt left a sticky error that kernel wrappers checking
+            // hipGetLastError after their launch would report as their own.
+            unsafe { sys::hipGetLastError() };
         } else {
             check(status)?;
         }
