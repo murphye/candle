@@ -21,7 +21,7 @@ const MODULES: &[(&str, &str)] = &[
     ("CONV", "candle-kernels/conv.cu"),
     ("FILL", "candle-kernels/fill.cu"),
     ("INDEXING", "candle-kernels/indexing.cu"),
-    ("MMVQ", "candle-kernels/mmvq_gguf.cu"),
+    ("MMVQ", "rocm/mmvq_rocm.cu"),
     ("QUANTIZED", "rocm/quantized_rocm.cu"),
     ("REDUCE", "candle-kernels/reduce.cu"),
     ("SORT", "candle-kernels/sort.cu"),

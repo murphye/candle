@@ -1084,19 +1084,7 @@ impl QRocmStorage {
         unsafe { builder.launch(cfg) }.w()?;
 
         // Same launch shape as the CUDA launcher: two rows per block past batch 1.
-        let rows_per_block = if b_size <= 1 { 1 } else { 2 };
-        let nwarps = if b_size <= 4 { 4 } else { 2 };
-        let cfg = LaunchConfig {
-            grid_dim: (nrows.div_ceil(rows_per_block) as u32, 1, 1),
-            block_dim: (WARP_SIZE as u32, nwarps, 1),
-            shared_mem_bytes: 0,
-        };
-        let func = dev.get_or_load_func(
-            &format!("mmvq_gguf_{tag}_{dst_tag}_plain_cuda{b_size}"),
-            &kernels::MMVQ,
-        )?;
         let weights = &self.data.inner;
-        let stride_col_y = (k_padded / GgmlDType::Q8_1.block_size()) as i32;
         let out = match rhs.dtype() {
             crate::DType::BF16 => S::BF16(unsafe { dev.alloc::<half::bf16>(nrows * b_size)? }),
             crate::DType::F16 => S::F16(unsafe { dev.alloc::<f16>(nrows * b_size)? }),
@@ -1108,6 +1096,46 @@ impl QRocmStorage {
             S::F32(s) => s.device_ptr(),
             _ => unreachable!(),
         };
+        // A single token gives each row its own warp unless there are too few rows
+        // to fill the GPU, where splitting long rows across warps wins.
+        if b_size == 1 && k <= 8 * nrows {
+            const ROWS_PER_BLOCK: usize = 4;
+            let cfg = LaunchConfig {
+                grid_dim: (nrows.div_ceil(ROWS_PER_BLOCK) as u32, 1, 1),
+                block_dim: (WARP_SIZE as u32, ROWS_PER_BLOCK as u32, 1),
+                shared_mem_bytes: 0,
+            };
+            let func =
+                dev.get_or_load_func(&format!("mmvq_gguf_{tag}_{dst_tag}_warp_row"), &kernels::MMVQ)?;
+            let mut builder = func.builder();
+            builder.arg(weights);
+            builder.arg(&y_q8_1);
+            builder.arg(&out_ptr);
+            barg!(builder, k as i32, nrows as i32);
+            unsafe { builder.launch(cfg) }.w()?;
+            let mut out_shape = rhs_l.shape().dims().to_vec();
+            out_shape.pop();
+            out_shape.push(nrows);
+            return Ok(Some((
+                RocmStorage {
+                    slice: out,
+                    device: dev.clone(),
+                },
+                out_shape.into(),
+            )));
+        }
+        let rows_per_block = if b_size <= 1 { 1 } else { 2 };
+        let nwarps = if b_size <= 4 { 4 } else { 2 };
+        let cfg = LaunchConfig {
+            grid_dim: (nrows.div_ceil(rows_per_block) as u32, 1, 1),
+            block_dim: (WARP_SIZE as u32, nwarps, 1),
+            shared_mem_bytes: 0,
+        };
+        let func = dev.get_or_load_func(
+            &format!("mmvq_gguf_{tag}_{dst_tag}_plain_cuda{b_size}"),
+            &kernels::MMVQ,
+        )?;
+        let stride_col_y = (k_padded / GgmlDType::Q8_1.block_size()) as i32;
         let mut builder = func.builder();
         builder.arg(weights);
         builder.arg(&y_q8_1);
