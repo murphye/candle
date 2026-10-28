@@ -11,9 +11,9 @@
 
 
 #define MOE_BM 32
-#define MOE_BN 64
-#define MOE_BK 32
-#define MOE_THREADS 128
+#define MOE_BN 128
+#define MOE_BK 64
+#define MOE_THREADS 256
 // Rows of the LDS tiles are padded by 8 bf16 to spread banks.
 #define MOE_LDS_K (MOE_BK + 8)
 #define MOE_ROUTE_THREADS 1024
@@ -115,11 +115,13 @@ static __device__ __forceinline__ void moe_dequant8_q4_K(const void *vx, int64_t
     get_scale_min_k4(sub, x->scales, sc, m);
     const float d = __low2float(x->dm) * sc;
     const float dmin = __high2float(x->dm) * m;
-    const uint8_t *q = x->qs + 32 * (sub / 2) + 8 * (part % 4);
+    // Eight quant bytes in one 8-byte load: super-blocks are 144 bytes, so this is aligned.
+    const uint2 qq = *(const uint2 *)(x->qs + 32 * (sub / 2) + 8 * (part % 4));
     const int shift = 4 * (sub & 1);
 #pragma unroll
     for (int l = 0; l < 8; ++l) {
-        out[l] = d * ((q[l] >> shift) & 0x0F) - dmin;
+        const uint32_t word = l < 4 ? qq.x : qq.y;
+        out[l] = d * ((word >> (8 * (l % 4) + shift)) & 0x0F) - dmin;
     }
 }
 
@@ -180,9 +182,13 @@ static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict_
     const int tid = threadIdx.x;
     const int wave = tid / 32;
 
-    __shared__ bfloat16_t a_lds[MOE_BM * MOE_LDS_K];
-    __shared__ bfloat16_t b_lds[MOE_BN * MOE_LDS_K];
-    __shared__ float c_lds[MOE_BM * MOE_BN];
+    // The output tile reuses the operand tiles' LDS once the K loop is done.
+    constexpr int OPERAND_BYTES = (MOE_BM + MOE_BN) * MOE_LDS_K * sizeof(bfloat16_t);
+    constexpr int OUTPUT_BYTES = MOE_BM * MOE_BN * sizeof(float);
+    __shared__ __align__(16) char lds[OPERAND_BYTES > OUTPUT_BYTES ? OPERAND_BYTES : OUTPUT_BYTES];
+    bfloat16_t *a_lds = (bfloat16_t *)lds;
+    bfloat16_t *b_lds = a_lds + MOE_BM * MOE_LDS_K;
+    float *c_lds = (float *)lds;
     __shared__ uint32_t pair_of[MOE_BM];
 
     if (tid < MOE_BM) {
@@ -199,26 +205,27 @@ static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict_
     const char *wexp = (const char *)w + (int64_t)expert * n * blocks_per_row * block_bytes;
 
     for (int k0 = 0; k0 < k; k0 += MOE_BK) {
-        // A: BM rows x BK, eight bf16 per thread (BM * BK / 8 = 128 groups).
-        {
-            const int r = tid / (MOE_BK / 8);
-            const int c = (tid % (MOE_BK / 8)) * 8;
-            __align__(16) bfloat16_t v[8];
+        // A: BM rows x BK in groups of eight; bf16 rows are copied with one 16-byte load.
+        for (int g = tid; g < MOE_BM * (MOE_BK / 8); g += MOE_THREADS) {
+            const int r = g / (MOE_BK / 8);
+            const int c = (g % (MOE_BK / 8)) * 8;
+            uint4 packed = make_uint4(0, 0, 0, 0);
             if (r < rows) {
                 const uint32_t pair = pair_of[r];
                 const int64_t xrow = x_per_pair ? pair : pair / topk;
                 const T *src = x + xrow * k + k0 + c;
+                if constexpr (sizeof(T) == 2 && std::is_same<T, __nv_bfloat16>::value) {
+                    packed = *(const uint4 *)src;
+                } else {
+                    __align__(16) bfloat16_t v[8];
 #pragma unroll
-                for (int l = 0; l < 8; ++l) {
-                    v[l] = static_cast<bfloat16_t>(moe_to_float(src[l]));
-                }
-            } else {
-#pragma unroll
-                for (int l = 0; l < 8; ++l) {
-                    v[l] = static_cast<bfloat16_t>(0.0f);
+                    for (int l = 0; l < 8; ++l) {
+                        v[l] = static_cast<bfloat16_t>(moe_to_float(src[l]));
+                    }
+                    packed = *(const uint4 *)v;
                 }
             }
-            *(uint4 *)(a_lds + r * MOE_LDS_K + c) = *(const uint4 *)v;
+            *(uint4 *)(a_lds + r * MOE_LDS_K + c) = packed;
         }
         // B: BN weight rows x BK, two 8-weight groups per thread.
 #pragma unroll

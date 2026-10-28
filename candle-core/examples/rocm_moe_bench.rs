@@ -20,7 +20,7 @@ fn main() -> Result<()> {
             let ids = Tensor::from_vec(ids, (tokens, topk), &device)?;
             // gate/up share one input row per token; down has one row per expert.
             let x_t = if name == "down" { topk } else { 1 };
-            let x = Tensor::randn(0f32, 1.0, (tokens, x_t, k), &device)?.to_dtype(DType::F32)?;
+            let x = Tensor::randn(0f32, 1.0, (tokens, x_t, k), &device)?.to_dtype(DType::BF16)?;
             let _ = qw.indexed_moe_forward(&x, &ids)?;
             device.synchronize()?;
             let iters = 10;

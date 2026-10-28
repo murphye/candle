@@ -674,8 +674,8 @@ impl QRocmStorage {
         use crate::backend::BackendStorage;
         use crate::rocm_backend::RocmStorageSlice as S;
         const BM: usize = 32;
-        const BN: usize = 64;
-        const BK: usize = 32;
+        const BN: usize = 128;
+        const BK: usize = 64;
         const MAX_EXPERTS: usize = 1024;
         let tag = match self.dtype() {
             GgmlDType::Q4_0 => "q4_0",
@@ -759,7 +759,7 @@ impl QRocmStorage {
         barg!(builder, n as i32, k as i32, topk as i32, (input_dim1 != 1) as i32);
         let cfg = LaunchConfig {
             grid_dim: (n.div_ceil(BN) as u32, max_tiles as u32, 1),
-            block_dim: (128, 1, 1),
+            block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
         unsafe { builder.launch(cfg) }.w()?;
