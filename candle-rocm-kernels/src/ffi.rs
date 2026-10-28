@@ -25,6 +25,10 @@ pub const hipEventDisableTiming: c_uint = 0x2;
 pub type hipDeviceAttribute_t = c_int;
 pub const hipDeviceAttributeIntegrated: hipDeviceAttribute_t = 16;
 
+pub type hipMemPool_t = *mut c_void;
+pub type hipMemPoolAttr = c_int;
+pub const hipMemPoolAttrReleaseThreshold: hipMemPoolAttr = 0x4;
+
 pub type hipStreamCaptureStatus = c_int;
 pub const hipStreamCaptureStatusNone: hipStreamCaptureStatus = 0;
 pub const hipStreamCaptureStatusActive: hipStreamCaptureStatus = 1;
@@ -63,6 +67,14 @@ extern "C" {
     pub fn hipEventSynchronize(event: hipEvent_t) -> hipError_t;
     pub fn hipEventDestroy(event: hipEvent_t) -> hipError_t;
 
+    pub fn hipDeviceGetDefaultMemPool(pool: *mut hipMemPool_t, device: c_int) -> hipError_t;
+    pub fn hipMemPoolSetAttribute(
+        pool: hipMemPool_t,
+        attr: hipMemPoolAttr,
+        value: *mut c_void,
+    ) -> hipError_t;
+    pub fn hipHostMalloc(ptr: *mut *mut c_void, size: usize, flags: c_uint) -> hipError_t;
+    pub fn hipHostFree(ptr: *mut c_void) -> hipError_t;
     pub fn hipMallocAsync(ptr: *mut *mut c_void, size: usize, stream: hipStream_t) -> hipError_t;
     pub fn hipFreeAsync(ptr: *mut c_void, stream: hipStream_t) -> hipError_t;
     pub fn hipMemcpyAsync(

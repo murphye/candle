@@ -816,6 +816,12 @@ impl QTensor {
     }
 
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "rocm")]
+        if let QStorage::Rocm(storage) = &self.storage {
+            if let Some(out) = self.rocm_grouped_moe_forward(storage, x, ids)? {
+                return Ok(out);
+            }
+        }
         match &self.storage {
             QStorage::Cuda(s) => match (&*x.storage(), &*ids.storage()) {
                 (Storage::Cuda(x_storage), Storage::Cuda(ids_storage)) => {
@@ -861,6 +867,73 @@ impl QTensor {
                 panic!("indexed_moe_forward is not implemented in this platform!");
             }
         }
+    }
+
+    /// Large-batch indexed MoE on ROCm: groups the (token, expert) pairs by expert,
+    /// dequantizes the expert weights to bf16 and runs one strided batched GEMM over
+    /// all experts. The fused per-pair kernel re-reads each expert's weights for
+    /// every pair, which dominates prefill. Returns `None` for small batches.
+    #[cfg(feature = "rocm")]
+    fn rocm_grouped_moe_forward(
+        &self,
+        storage: &rocm::QRocmStorage,
+        x: &Tensor,
+        ids: &Tensor,
+    ) -> Result<Option<Tensor>> {
+        // Below this many pairs the fused kernel is faster: the grouped path pays a
+        // fixed cost to dequantize every expert (about 2 ms for 288 experts of
+        // 640x2560 on gfx1201), which the fused kernel beats up to ~150 tokens x 10.
+        const MIN_PAIRS: usize = 1536;
+        let (num_experts, n, k) = self.shape.dims3()?;
+        let (tokens, topk) = ids.dims2()?;
+        let (x_tokens, x_t, x_k) = x.dims3()?;
+        if tokens * topk < MIN_PAIRS || x_tokens != tokens || x_k != k || (x_t != 1 && x_t != topk)
+        {
+            return Ok(None);
+        }
+        let ids_host = ids.flatten_all()?.to_dtype(DType::U32)?.to_vec1::<u32>()?;
+        let mut counts = vec![0usize; num_experts];
+        for &e in &ids_host {
+            let e = e as usize;
+            if e >= num_experts {
+                crate::bail!("expert id {e} out of range for {num_experts} experts");
+            }
+            counts[e] += 1;
+        }
+        let rows = counts.iter().copied().max().unwrap_or(0);
+        // Each expert gets `rows` padded input rows; `src` picks them from x and
+        // `dst` maps every (token, slot) pair to its row in the batched output.
+        let mut src = vec![0u32; num_experts * rows];
+        let mut dst = vec![0u32; tokens * topk];
+        let mut fill = vec![0usize; num_experts];
+        for (pair, &e) in ids_host.iter().enumerate() {
+            let e = e as usize;
+            let row = if x_t == 1 { pair / topk } else { pair };
+            let at = e * rows + fill[e];
+            fill[e] += 1;
+            src[at] = row as u32;
+            dst[pair] = at as u32;
+        }
+        let device = x.device();
+        let x_rows = x.reshape((tokens * x_t, k))?.to_dtype(DType::BF16)?;
+        let src = Tensor::from_vec(src, num_experts * rows, device)?;
+        let x_pad = x_rows
+            .index_select(&src, 0)?
+            .reshape((num_experts, rows, k))?;
+        let weights = crate::tensor::from_storage(
+            Storage::Rocm(storage.dequantize_bf16(num_experts * n * k)?),
+            (num_experts, n, k),
+            crate::op::BackpropOp::none(),
+            false,
+        );
+        let out = x_pad.matmul(&weights.transpose(1, 2)?)?;
+        let dst = Tensor::from_vec(dst, tokens * topk, device)?;
+        let out = out
+            .reshape((num_experts * rows, n))?
+            .index_select(&dst, 0)?
+            .reshape((tokens, topk, n))?
+            .to_dtype(DType::F32)?;
+        Ok(Some(out))
     }
 
     pub fn device_ptr(&self) -> Result<*const u8> {

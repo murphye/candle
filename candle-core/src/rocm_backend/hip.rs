@@ -181,11 +181,62 @@ device_repr!(
     float8::F8E4M3
 );
 
+/// Keeps memory freed with `hipFreeAsync` in the device's default pool instead of
+/// returning it to the driver at every synchronization. With the default
+/// threshold of zero, large temporary buffers are remapped on each use, which
+/// costs milliseconds per allocation.
+fn retain_freed_pool_memory(ordinal: usize) -> Result<(), HipError> {
+    let mut pool = std::ptr::null_mut();
+    check(unsafe { sys::hipDeviceGetDefaultMemPool(&mut pool, ordinal as i32) })?;
+    let mut threshold = u64::MAX;
+    check(unsafe {
+        sys::hipMemPoolSetAttribute(
+            pool,
+            sys::hipMemPoolAttrReleaseThreshold,
+            &mut threshold as *mut u64 as *mut c_void,
+        )
+    })
+}
+
+/// Pinned host buffers for small host-to-device copies. Copies from pageable
+/// memory have to finish before the source may be reused, which stalls the host
+/// until the stream drains. Staged copies are asynchronous: each slot records an
+/// event after its copy and is only reused once that event has completed.
+#[derive(Debug)]
+struct Staging {
+    base: *mut u8,
+    events: Vec<sys::hipEvent_t>,
+    next: usize,
+}
+
+const STAGING_SLOT_BYTES: usize = 256 * 1024;
+const STAGING_SLOTS: usize = 32;
+
+impl Staging {
+    fn new() -> Result<Self, HipError> {
+        let mut base = std::ptr::null_mut();
+        check(unsafe { sys::hipHostMalloc(&mut base, STAGING_SLOT_BYTES * STAGING_SLOTS, 0) })?;
+        let mut events = Vec::with_capacity(STAGING_SLOTS);
+        for _ in 0..STAGING_SLOTS {
+            let mut event = std::ptr::null_mut();
+            check(unsafe { sys::hipEventCreateWithFlags(&mut event, sys::hipEventDisableTiming) })?;
+            // Record once so the first wait on every slot returns immediately.
+            events.push(event);
+        }
+        Ok(Self {
+            base: base as *mut u8,
+            events,
+            next: 0,
+        })
+    }
+}
+
 /// A stream on a given device. All candle work for a device is ordered on one.
 #[derive(Debug)]
 pub struct HipStream {
     raw: sys::hipStream_t,
     ordinal: usize,
+    staging: std::sync::Mutex<Option<Staging>>,
 }
 
 // SAFETY: HIP streams may be used from any thread once created.
@@ -195,9 +246,18 @@ unsafe impl Sync for HipStream {}
 impl HipStream {
     pub fn new(ordinal: usize) -> Result<Arc<Self>, HipError> {
         bind_device(ordinal)?;
+        retain_freed_pool_memory(ordinal)?;
         let mut raw = std::ptr::null_mut();
         check(unsafe { sys::hipStreamCreateWithFlags(&mut raw, sys::hipStreamNonBlocking) })?;
-        Ok(Arc::new(Self { raw, ordinal }))
+        let staging = Staging::new()?;
+        for &event in &staging.events {
+            check(unsafe { sys::hipEventRecord(event, raw) })?;
+        }
+        Ok(Arc::new(Self {
+            raw,
+            ordinal,
+            staging: std::sync::Mutex::new(Some(staging)),
+        }))
     }
 
     pub fn raw(&self) -> sys::hipStream_t {
@@ -271,7 +331,8 @@ impl HipStream {
     }
 
     /// Copies host data to the device. The call returns once `src` has been
-    /// consumed, so the host buffer may be reused immediately.
+    /// consumed, so the host buffer may be reused immediately. Small copies go
+    /// through pinned staging buffers and do not wait for the stream.
     pub fn memcpy_htod<T: DeviceRepr, Dst: DevicePtrMut<T>>(
         &self,
         src: &[T],
@@ -283,6 +344,28 @@ impl HipStream {
             return Ok(());
         }
         self.bind()?;
+        if bytes <= STAGING_SLOT_BYTES {
+            let mut staging = self.staging.lock().unwrap();
+            if let Some(staging) = staging.as_mut() {
+                let slot = staging.next;
+                staging.next = (slot + 1) % STAGING_SLOTS;
+                let event = staging.events[slot];
+                // Wait until the previous copy out of this slot has been consumed.
+                check(unsafe { sys::hipEventSynchronize(event) })?;
+                let pinned = unsafe { staging.base.add(slot * STAGING_SLOT_BYTES) };
+                unsafe { std::ptr::copy_nonoverlapping(src.as_ptr() as *const u8, pinned, bytes) };
+                check(unsafe {
+                    sys::hipMemcpyAsync(
+                        dst.device_ptr() as *mut c_void,
+                        pinned as *const c_void,
+                        bytes,
+                        sys::hipMemcpyHostToDevice,
+                        self.raw,
+                    )
+                })?;
+                return check(unsafe { sys::hipEventRecord(event, self.raw) });
+            }
+        }
         check(unsafe {
             sys::hipMemcpyAsync(
                 dst.device_ptr() as *mut c_void,
@@ -404,6 +487,12 @@ impl Drop for HipStream {
         if bind_device(self.ordinal).is_ok() {
             unsafe {
                 sys::hipStreamSynchronize(self.raw);
+                if let Some(staging) = self.staging.get_mut().ok().and_then(Option::take) {
+                    for event in staging.events {
+                        sys::hipEventDestroy(event);
+                    }
+                    sys::hipHostFree(staging.base as *mut c_void);
+                }
                 sys::hipStreamDestroy(self.raw);
             }
         }
