@@ -64,7 +64,14 @@ fn indexed_moe_case(
         .map(|i| ((i * 3 + i / topk) % num_experts) as u32)
         .collect();
     let ids_cpu = Tensor::from_vec(ids.clone(), (tokens, topk), &Device::Cpu)?;
-    for dtype in [GgmlDType::Q8_0, GgmlDType::Q4K, GgmlDType::Q6K] {
+    for dtype in [
+        GgmlDType::Q4_0,
+        GgmlDType::Q5_0,
+        GgmlDType::Q5_1,
+        GgmlDType::Q8_0,
+        GgmlDType::Q4K,
+        GgmlDType::Q6K,
+    ] {
         let qw = QTensor::quantize(&w.to_device(&rocm)?, dtype)?;
         let w_deq = QTensor::quantize(&w, dtype)?.dequantize(&Device::Cpu)?;
         // One input row per token, shared by its experts, and one row per expert.

@@ -9,6 +9,7 @@ fn main() -> Result<()> {
     for (name, n, k, dtype) in [
         ("gate/up", inter, hidden, GgmlDType::Q4K),
         ("down", hidden, inter, GgmlDType::Q8_0),
+        ("down", hidden, inter, GgmlDType::Q5_0),
     ] {
         let w = Tensor::randn(0f32, 1.0, (experts, n, k), &device)?;
         let qw = QTensor::quantize(&w, dtype)?;
