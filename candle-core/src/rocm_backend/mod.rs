@@ -452,6 +452,67 @@ fn slice_ptr<T: DeviceRepr>(v: &HipSlice<T>, lo: usize) -> (u64, ()) {
     (v.slice(lo..).device_ptr(), ())
 }
 
+/// Most rows a matmul can have and still go through the GEMV kernel.
+const GEMV_MAX_ROWS: usize = 8;
+const GEMV_WARPS: u32 = 4;
+
+/// `lhs . rhs` for a few contiguous `lhs` rows against a transposed contiguous weight
+/// (`x.matmul(&w.t())` with `w: [n, k]`, shared across the batch), or `None` when the
+/// operands don't have that shape.
+#[allow(clippy::type_complexity)]
+fn try_gemv<T: DeviceRepr + ValidAsZeroBits>(
+    dev: &RocmDevice,
+    lhs: &HipSlice<T>,
+    rhs: &HipSlice<T>,
+    (b, m, n, k, lhs_l, rhs_l): (usize, usize, usize, usize, &Layout, &Layout),
+    kname: &str,
+) -> Result<Option<HipSlice<T>>> {
+    let rows = b * m;
+    let vec = 16 / std::mem::size_of::<T>();
+    if rows == 0 || rows > GEMV_MAX_ROWS || n == 0 || k == 0 || k % vec != 0 {
+        return Ok(None);
+    }
+    if !lhs_l.is_contiguous() {
+        return Ok(None);
+    }
+    let (dims, stride) = (rhs_l.dims(), rhs_l.stride());
+    let rank = dims.len();
+    if rank < 2 || stride[rank - 2] != 1 || (n > 1 && stride[rank - 1] != k) {
+        return Ok(None);
+    }
+    if dims[..rank - 2]
+        .iter()
+        .zip(&stride[..rank - 2])
+        .any(|(d, s)| *d != 1 && *s != 0)
+    {
+        return Ok(None);
+    }
+    let x = lhs.slice(lhs_l.start_offset()..).device_ptr();
+    let w = rhs.slice(rhs_l.start_offset()..).device_ptr();
+    if x % 16 != 0 || w % 16 != 0 {
+        return Ok(None);
+    }
+    let out = unsafe { dev.alloc::<T>(rows * n)? };
+    let func = dev.get_or_load_func(kname, &kernels::GEMV)?;
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(GEMV_WARPS), 1, 1),
+        block_dim: (32, GEMV_WARPS, 1),
+        shared_mem_bytes: 0,
+    };
+    let y = out.device_ptr();
+    let (n, k, rows) = (n as i32, k as i32, rows as i32);
+    let mut builder = func.builder();
+    builder.arg(&w);
+    builder.arg(&x);
+    builder.arg(&y);
+    builder.arg(&n);
+    builder.arg(&k);
+    builder.arg(&rows);
+    // SAFETY: ffi; the operand shapes and alignment were checked above.
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(Some(out))
+}
+
 struct IndexSelect<'a>(&'a RocmStorage, &'a Layout, usize);
 impl Map1 for IndexSelect<'_> {
     fn f<T: DeviceRepr + WithDType + ValidAsZeroBits>(
@@ -2098,6 +2159,25 @@ impl BackendStorage for RocmStorage {
     ) -> Result<Self> {
         let elem_count = b * m * n;
         let dev = &self.device;
+        let gemv = (b, m, n, k, lhs_l, rhs_l);
+        let gemv_slice = match (&self.slice, &rhs.slice) {
+            (RocmStorageSlice::BF16(l), RocmStorageSlice::BF16(r)) => {
+                try_gemv(dev, l, r, gemv, "gemv_bf16")?.map(RocmStorageSlice::BF16)
+            }
+            (RocmStorageSlice::F16(l), RocmStorageSlice::F16(r)) => {
+                try_gemv(dev, l, r, gemv, "gemv_f16")?.map(RocmStorageSlice::F16)
+            }
+            (RocmStorageSlice::F32(l), RocmStorageSlice::F32(r)) => {
+                try_gemv(dev, l, r, gemv, "gemv_f32")?.map(RocmStorageSlice::F32)
+            }
+            _ => None,
+        };
+        if let Some(slice) = gemv_slice {
+            return Ok(Self {
+                slice,
+                device: dev.clone(),
+            });
+        }
         let slice = match (&self.slice, &rhs.slice) {
             (RocmStorageSlice::BF16(lhs), RocmStorageSlice::BF16(rhs)) => {
                 let lhs = &lhs.slice(lhs_l.start_offset()..);
