@@ -43,3 +43,36 @@ fn quantized_matmul_matches_cpu() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn indexed_moe_forward_matches_cpu() -> Result<()> {
+    let rocm = Device::new_rocm(0)?;
+    let (num_experts, n, k, tokens, topk) = (8, 64, 512, 5, 2);
+    let w = Tensor::randn(0f32, 1.0, (num_experts, n, k), &Device::Cpu)?;
+    let ids: Vec<u32> = (0..tokens * topk)
+        .map(|i| ((i * 3 + 1) % num_experts) as u32)
+        .collect();
+    let ids_cpu = Tensor::from_vec(ids.clone(), (tokens, topk), &Device::Cpu)?;
+    for dtype in [GgmlDType::Q8_0, GgmlDType::Q4K, GgmlDType::Q6K] {
+        let qw = QTensor::quantize(&w.to_device(&rocm)?, dtype)?;
+        let w_deq = QTensor::quantize(&w, dtype)?.dequantize(&Device::Cpu)?;
+        // One input row per token, shared by its experts, and one row per expert.
+        for x_t in [1, topk] {
+            let x = Tensor::randn(0f32, 1.0, (tokens, x_t, k), &Device::Cpu)?;
+            let got = qw.indexed_moe_forward(&x.to_device(&rocm)?, &ids_cpu.to_device(&rocm)?)?;
+            assert_eq!(got.dims(), &[tokens, topk, n]);
+            let mut rows = Vec::new();
+            for t in 0..tokens {
+                for j in 0..topk {
+                    let xr = x.get(t)?.get(if x_t == 1 { 0 } else { j })?;
+                    let we = w_deq.get(ids[t * topk + j] as usize)?;
+                    rows.push(we.matmul(&xr.unsqueeze(1)?)?.squeeze(1)?);
+                }
+            }
+            let expected = Tensor::stack(&rows, 0)?.reshape((tokens, topk, n))?;
+            let diff = max_rel_diff(&expected, &got)?;
+            assert!(diff < 0.05, "{dtype:?} x_t={x_t}: relative diff {diff}");
+        }
+    }
+    Ok(())
+}
