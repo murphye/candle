@@ -93,15 +93,32 @@ thread_local! {
     static CURRENT_DEVICE: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
 }
 
+/// Set by an exit handler that runs before the HIP runtime's own teardown. Threads
+/// still dropping device objects at that point must not call into the runtime.
+static EXITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn mark_exiting() {
+    EXITING.store(true, std::sync::atomic::Ordering::Release);
+}
+
 /// Makes `ordinal` the current HIP device for this thread. HIP resolves streams,
 /// allocations and modules against the calling thread's current device, so
-/// every entry point that touches a device goes through here first.
+/// every entry point that touches a device goes through here first. Fails once
+/// the process is exiting, which turns the HIP calls in `Drop` impls into no-ops.
 pub fn bind_device(ordinal: usize) -> Result<(), HipError> {
+    static REGISTER_EXIT: std::sync::Once = std::sync::Once::new();
+    if EXITING.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(HipError(sys::hipErrorDeinitialized));
+    }
     let ordinal = ordinal as i32;
     CURRENT_DEVICE.with(|current| {
         if current.get() != ordinal {
             check(unsafe { sys::hipSetDevice(ordinal) })?;
             current.set(ordinal);
+            // Registered after the runtime initialized, so it runs before the runtime's teardown.
+            REGISTER_EXIT.call_once(|| unsafe {
+                libc::atexit(mark_exiting);
+            });
         }
         Ok(())
     })

@@ -13,6 +13,7 @@ pub type hipDeviceptr_t = *mut c_void;
 
 pub const hipSuccess: hipError_t = 0;
 pub const hipErrorOutOfMemory: hipError_t = 2;
+pub const hipErrorDeinitialized: hipError_t = 4;
 
 pub type hipMemcpyKind = c_int;
 pub const hipMemcpyHostToDevice: hipMemcpyKind = 1;
