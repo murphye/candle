@@ -64,6 +64,10 @@ fn main() {
         "cargo::warning=candle-rocm-kernels: building for {}",
         archs.join(",")
     );
+    // Exported to dependents that compile their own kernels against the same
+    // compatibility headers and targets: DEP_CANDLE_ROCM_KERNELS_{HIP_COMPAT,ARCHS}.
+    println!("cargo::metadata=hip_compat={}", compat.display());
+    println!("cargo::metadata=archs={}", archs.join(","));
 
     let jobs: Vec<(String, PathBuf, PathBuf)> = MODULES
         .iter()

@@ -65,6 +65,24 @@ __device__ __forceinline__ int __vsubss4(const int a, const int b) {
 #define __shfl_down_sync(mask, ...) __shfl_down(__VA_ARGS__)
 #define __shfl_up_sync(mask, ...) __shfl_up(__VA_ARGS__)
 
+// CUDA runtime API names used by host-side kernel launchers.
+#define cudaStream_t hipStream_t
+#define cudaError_t hipError_t
+#define cudaSuccess hipSuccess
+#define cudaGetLastError hipGetLastError
+#define cudaPeekAtLastError hipPeekAtLastError
+#define cudaGetErrorString hipGetErrorString
+#define cudaGetDevice hipGetDevice
+#define cudaDeviceGetAttribute hipDeviceGetAttribute
+#define cudaDevAttrMaxSharedMemoryPerBlockOptin hipDeviceAttributeSharedMemPerBlockOptin
+#define cudaDevAttrMultiProcessorCount hipDeviceAttributeMultiprocessorCount
+#define cudaFuncAttributes hipFuncAttributes
+#define cudaFuncGetAttributes hipFuncGetAttributes
+#define cudaFuncSetAttribute hipFuncSetAttribute
+#define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
+#define cudaMemsetAsync hipMemsetAsync
+#define cudaMemcpyAsync hipMemcpyAsync
+
 // The kernels gate their f16/bf16/fp8 instantiations on the CUDA compute
 // capability. All of these types are available on the supported AMD targets.
 // Defined last so that the HIP and libhipcxx headers above never see it.

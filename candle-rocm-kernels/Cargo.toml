@@ -8,5 +8,7 @@ repository = "https://github.com/huggingface/candle"
 keywords = ["blas", "tensor", "machine-learning", "rocm", "hip"]
 categories = ["science"]
 license = "MIT OR Apache-2.0"
+# Lets dependent build scripts read the exported metadata (DEP_CANDLE_ROCM_KERNELS_*).
+links = "candle_rocm_kernels"
 
 [dependencies]
