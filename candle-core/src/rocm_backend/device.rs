@@ -35,7 +35,12 @@ pub struct ModuleStore {
     mdls: [Option<Arc<HipModule>>; kernels::ALL_IDS.len()],
     /// Functions already looked up, per module, so a launch skips hipModuleGetFunction.
     funcs: [HashMap<String, HipFunction>; kernels::ALL_IDS.len()],
+    /// Functions found by [`RocmDevice::get_or_load_func_keyed`], keyed without a name string.
+    keyed: HashMap<FuncKey, HipFunction>,
 }
+
+/// Addresses of static name parts plus a small variant number.
+type FuncKey = (usize, usize, usize, usize);
 
 #[derive(Clone)]
 pub struct RocmDevice {
@@ -208,6 +213,37 @@ impl RocmDevice {
         })
     }
 
+    /// [`Self::get_or_load_func`] for hot launch paths: the function is cached under the
+    /// addresses of static name parts and a variant number, so a hit neither formats nor
+    /// hashes a name. `name` builds the full kernel name on a miss.
+    pub fn get_or_load_func_keyed(
+        &self,
+        parts: (&'static str, &'static str, &'static str),
+        variant: usize,
+        mdl: &kernels::Module,
+        name: impl FnOnce() -> String,
+    ) -> Result<RocmFunc> {
+        let key = (
+            parts.0.as_ptr() as usize,
+            parts.1.as_ptr() as usize,
+            parts.2.as_ptr() as usize,
+            variant,
+        );
+        if let Some(func) = self.modules.read().unwrap().keyed.get(&key) {
+            return Ok(RocmFunc {
+                func: func.clone(),
+                stream: self.stream.clone(),
+            });
+        }
+        let func = self.get_or_load_func(&name(), mdl)?;
+        self.modules
+            .write()
+            .unwrap()
+            .keyed
+            .insert(key, func.func.clone());
+        Ok(func)
+    }
+
     pub fn rocblas_handle(&self) -> Arc<RocBlas> {
         self.blas.clone()
     }
@@ -269,6 +305,7 @@ impl BackendDevice for RocmDevice {
         let module_store = ModuleStore {
             mdls: [const { None }; kernels::ALL_IDS.len()],
             funcs: std::array::from_fn(|_| HashMap::new()),
+            keyed: HashMap::new(),
         };
         Ok(Self {
             id: DeviceId::new(),

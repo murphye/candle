@@ -1280,9 +1280,11 @@ impl QRocmStorage {
                 let row_bytes =
                     k_padded / GgmlDType::Q8_1.block_size() * GgmlDType::Q8_1.type_size();
                 let y = unsafe { dev.alloc::<u8>(b_size * row_bytes)? };
-                let func = dev.get_or_load_func(
-                    &format!("mmvq_gguf_quantize_q8_1_{dst_tag}"),
+                let func = dev.get_or_load_func_keyed(
+                    ("quantize_q8_1", dst_tag, ""),
+                    0,
                     &kernels::MMVQ,
+                    || format!("mmvq_gguf_quantize_q8_1_{dst_tag}"),
                 )?;
                 let cfg = LaunchConfig {
                     grid_dim: (
@@ -1330,7 +1332,9 @@ impl QRocmStorage {
                 shared_mem_bytes: 0,
             };
             let func =
-                dev.get_or_load_func(&format!("mmvq_gguf_{tag}_{dst_tag}_warp_row"), &kernels::MMVQ)?;
+                dev.get_or_load_func_keyed((tag, dst_tag, "warp_row"), 1, &kernels::MMVQ, || {
+                    format!("mmvq_gguf_{tag}_{dst_tag}_warp_row")
+                })?;
             let mut builder = func.builder();
             builder.arg(weights);
             builder.arg(&y_q8_1);
@@ -1357,9 +1361,11 @@ impl QRocmStorage {
                 block_dim: (WARP_SIZE as u32, ROWS_PER_BLOCK as u32, 1),
                 shared_mem_bytes: 0,
             };
-            let func = dev.get_or_load_func(
-                &format!("mmvq_gguf_{tag}_{dst_tag}_warp_row{b_size}"),
+            let func = dev.get_or_load_func_keyed(
+                (tag, dst_tag, "warp_row"),
+                b_size,
                 &kernels::MMVQ,
+                || format!("mmvq_gguf_{tag}_{dst_tag}_warp_row{b_size}"),
             )?;
             let stride_col_y = (k_padded / GgmlDType::Q8_1.block_size()) as i32;
             let mut builder = func.builder();
@@ -1387,9 +1393,11 @@ impl QRocmStorage {
             block_dim: (WARP_SIZE as u32, nwarps, 1),
             shared_mem_bytes: 0,
         };
-        let func = dev.get_or_load_func(
-            &format!("mmvq_gguf_{tag}_{dst_tag}_plain_cuda{b_size}"),
+        let func = dev.get_or_load_func_keyed(
+            (tag, dst_tag, "plain_cuda"),
+            b_size,
             &kernels::MMVQ,
+            || format!("mmvq_gguf_{tag}_{dst_tag}_plain_cuda{b_size}"),
         )?;
         let stride_col_y = (k_padded / GgmlDType::Q8_1.block_size()) as i32;
         let mut builder = func.builder();
