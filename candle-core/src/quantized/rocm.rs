@@ -664,9 +664,11 @@ impl QRocmStorage {
             &format!("indexed_moe_{tag}_{dst_tag}"),
             &kernels::QUANTIZED,
         )?;
+        // One output row per warp.
+        const ROWS_PER_BLOCK: usize = 4;
         let cfg = LaunchConfig {
-            grid_dim: (n as u32, batch as u32, topk as u32),
-            block_dim: (WARP_SIZE as u32, 4, 1),
+            grid_dim: (n.div_ceil(ROWS_PER_BLOCK) as u32, batch as u32, topk as u32),
+            block_dim: (WARP_SIZE as u32, ROWS_PER_BLOCK as u32, 1),
             shared_mem_bytes: 0,
         };
         let mut builder = func.builder();
