@@ -107,3 +107,26 @@ fn indexed_moe_case(
     }
     Ok(())
 }
+
+#[test]
+fn indexed_moe_glu_matches_separate_projections() -> Result<()> {
+    let rocm = Device::new_rocm(0)?;
+    let (num_experts, n, k, tokens, topk) = (8, 64, 512, 3, 2);
+    let ids: Vec<u32> = (0..tokens * topk).map(|i| ((i * 3 + 1) % num_experts) as u32).collect();
+    let ids = Tensor::from_vec(ids, (tokens, topk), &rocm)?;
+    for dtype in [GgmlDType::Q4K, GgmlDType::Q8_0, GgmlDType::Q5_0] {
+        let gate = QTensor::quantize(&Tensor::randn(0f32, 1.0, (num_experts, n, k), &rocm)?, dtype)?;
+        let up = QTensor::quantize(&Tensor::randn(0f32, 1.0, (num_experts, n, k), &rocm)?, dtype)?;
+        let x = Tensor::randn(0f32, 1.0, (tokens, 1, k), &rocm)?.to_dtype(DType::BF16)?;
+        let got = gate
+            .rocm_indexed_moe_glu_forward(&up, 0, &x, &ids)?
+            .expect("fused path");
+        assert_eq!(got.dtype(), DType::BF16);
+        let g = gate.indexed_moe_forward(&x, &ids)?.to_dtype(DType::F32)?;
+        let u = up.indexed_moe_forward(&x, &ids)?.to_dtype(DType::F32)?;
+        let expected = (g.silu()? * u)?;
+        let diff = max_rel_diff(&expected, &got)?;
+        assert!(diff < 0.02, "{dtype:?}: relative diff {diff}");
+    }
+    Ok(())
+}

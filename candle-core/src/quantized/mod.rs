@@ -577,6 +577,11 @@ fn check_shape(shape: &Shape, block_size: usize) -> Result<()> {
     Ok(())
 }
 
+/// (token, expert) pairs from which the ROCm indexed MoE switches from the per-pair
+/// kernel to grouping by expert with a dequantize + batched GEMM.
+#[cfg(feature = "rocm")]
+const ROCM_GROUPED_MOE_MIN_PAIRS: usize = 1536;
+
 impl QTensor {
     pub fn new<S: Into<Shape>>(storage: QStorage, shape: S) -> Result<Self> {
         let shape = shape.into();
@@ -815,6 +820,41 @@ impl QTensor {
         self.storage.data()
     }
 
+    /// Fused gate/up of GLU experts on ROCm: `act(x @ self[ids]^T) * (x @ up[ids]^T)`
+    /// with `act` 0 for silu and 1 for tanh gelu, returning `[tokens, topk, n]` in
+    /// x's dtype. Returns `None` where only separate projections are available.
+    #[cfg(feature = "rocm")]
+    pub fn rocm_indexed_moe_glu_forward(
+        &self,
+        up: &QTensor,
+        act: i32,
+        x: &Tensor,
+        ids: &Tensor,
+    ) -> Result<Option<Tensor>> {
+        let (QStorage::Rocm(gate_s), QStorage::Rocm(up_s)) = (&self.storage, &up.storage) else {
+            return Ok(None);
+        };
+        if self.shape != up.shape || self.dtype() != up.dtype() {
+            return Ok(None);
+        }
+        // Large batches go through the grouped dequantize + GEMM path.
+        let (tokens, topk) = ids.dims2()?;
+        if tokens * topk >= ROCM_GROUPED_MOE_MIN_PAIRS {
+            return Ok(None);
+        }
+        let (Storage::Rocm(x_s), Storage::Rocm(ids_s)) = (&*x.storage(), &*ids.storage()) else {
+            return Ok(None);
+        };
+        let (storage, shape) =
+            gate_s.indexed_moe_glu_forward(up_s, act, self.shape(), x_s, x.layout(), ids_s, ids.layout())?;
+        Ok(Some(crate::tensor::from_storage(
+            Storage::Rocm(storage),
+            shape,
+            crate::op::BackpropOp::none(),
+            false,
+        )))
+    }
+
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "rocm")]
         if let QStorage::Rocm(storage) = &self.storage {
@@ -883,7 +923,7 @@ impl QTensor {
         // Below this many pairs the fused kernel is faster: the grouped path pays a
         // fixed cost to dequantize every expert (about 2 ms for 288 experts of
         // 640x2560 on gfx1201), which the fused kernel beats up to ~150 tokens x 10.
-        const MIN_PAIRS: usize = 1536;
+        const MIN_PAIRS: usize = ROCM_GROUPED_MOE_MIN_PAIRS;
         let (num_experts, n, k) = self.shape.dims3()?;
         let (tokens, topk) = ids.dims2()?;
         let (x_tokens, x_t, x_k) = x.dims3()?;

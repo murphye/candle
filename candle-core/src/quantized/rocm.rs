@@ -612,6 +612,37 @@ impl QRocmStorage {
         ids: &RocmStorage,
         ids_l: &crate::Layout,
     ) -> Result<(RocmStorage, crate::Shape)> {
+        self.indexed_moe(None, self_shape, input, input_l, ids, ids_l)
+    }
+
+    /// `act(x @ self[ids]^T) * (x @ up[ids]^T)` in one kernel, for GLU experts whose
+    /// gate (`self`) and up weights share shape and type. `act`: 0 silu, 1 gelu (tanh).
+    #[allow(clippy::too_many_arguments)]
+    pub fn indexed_moe_glu_forward(
+        &self,
+        up: &QRocmStorage,
+        act: i32,
+        self_shape: &crate::Shape,
+        input: &RocmStorage,
+        input_l: &crate::Layout,
+        ids: &RocmStorage,
+        ids_l: &crate::Layout,
+    ) -> Result<(RocmStorage, crate::Shape)> {
+        if up.dtype() != self.dtype() || up.data.len != self.data.len {
+            crate::bail!("indexed_moe_glu_forward: gate and up weights differ");
+        }
+        self.indexed_moe(Some((up, act)), self_shape, input, input_l, ids, ids_l)
+    }
+
+    fn indexed_moe(
+        &self,
+        glu: Option<(&QRocmStorage, i32)>,
+        self_shape: &crate::Shape,
+        input: &RocmStorage,
+        input_l: &crate::Layout,
+        ids: &RocmStorage,
+        ids_l: &crate::Layout,
+    ) -> Result<(RocmStorage, crate::Shape)> {
         use crate::backend::BackendStorage;
         use crate::rocm_backend::RocmStorageSlice as S;
         let Some(tag) = indexed_moe_tag(self.dtype()) else {
@@ -681,10 +712,11 @@ impl QRocmStorage {
             S::F32(s) => s.device_ptr(),
             _ => unreachable!(),
         };
-        let func = dev.get_or_load_func(
-            &format!("indexed_moe_{tag}_{dst_tag}"),
-            &kernels::QUANTIZED,
-        )?;
+        let name = match glu {
+            Some(_) => format!("indexed_moe_glu_{tag}_{dst_tag}"),
+            None => format!("indexed_moe_{tag}_{dst_tag}"),
+        };
+        let func = dev.get_or_load_func(&name, &kernels::QUANTIZED)?;
         // One output row per warp.
         const ROWS_PER_BLOCK: usize = 4;
         let cfg = LaunchConfig {
@@ -692,8 +724,12 @@ impl QRocmStorage {
             block_dim: (WARP_SIZE as u32, ROWS_PER_BLOCK as u32, 1),
             shared_mem_bytes: 0,
         };
+        let act = glu.map_or(0i32, |(_, act)| act);
         let mut builder = func.builder();
         builder.arg(&self.data.inner);
+        if let Some((up, _)) = glu {
+            builder.arg(&up.data.inner);
+        }
         builder.arg(&x_q8_1);
         builder.arg(&ids_ptr);
         builder.arg(&out_ptr);
@@ -704,6 +740,9 @@ impl QRocmStorage {
             k_padded as i32,
             input_dim1 as i32
         );
+        if glu.is_some() {
+            builder.arg(&act);
+        }
         unsafe { builder.launch(cfg) }.w()?;
         Ok((
             RocmStorage {

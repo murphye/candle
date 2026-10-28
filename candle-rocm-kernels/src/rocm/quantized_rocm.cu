@@ -68,6 +68,55 @@ __device__ void indexed_moe_dst(
     }
 }
 
+// Gate and up projections of a GLU expert in one pass: each warp computes the
+// same row of both weights and writes act(gate) * up. act: 0 silu, 1 gelu (tanh).
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda, typename dst_t>
+__device__ void indexed_moe_glu(
+    const void * __restrict__ gate_weights,
+    const void * __restrict__ up_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    dst_t * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int k_padded,
+    const int input_dim1,
+    const int act) {
+    const int task_id = blockIdx.y * gridDim.z + blockIdx.z;
+    const int input_idx = (input_dim1 == 1) ? blockIdx.y : task_id;
+    const unsigned int expert_id = indices[task_id];
+    const int row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (row >= n) {
+        return;
+    }
+
+    const size_t weight_expert_stride_bytes = (size_t)n * k / qk * sizeof(block_q_t);
+    const size_t input_task_stride_bytes = (size_t)k_padded / QK8_1 * sizeof(block_q8_1);
+    const block_q_t * wg = (const block_q_t *)((const char *)gate_weights + expert_id * weight_expert_stride_bytes);
+    const block_q_t * wu = (const block_q_t *)((const char *)up_weights + expert_id * weight_expert_stride_bytes);
+    const block_q8_1 * x = (const block_q8_1 *)((const char *)all_inputs + input_idx * input_task_stride_bytes);
+
+    const int blocks_per_row_x = k / qk;
+    constexpr int blocks_per_iter = vdr * WARP_SIZE / qi;
+
+    float g = 0.0f;
+    float u = 0.0f;
+    for (int kbx = threadIdx.x / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk / QK8_1);
+        const int kqs = vdr * (threadIdx.x % (qi / vdr));
+        g += vec_dot_q_cuda(&wg[kbx + row * blocks_per_row_x], &x[kby], kqs);
+        u += vec_dot_q_cuda(&wu[kbx + row * blocks_per_row_x], &x[kby], kqs);
+    }
+    g = warp_reduce_sum(g);
+    u = warp_reduce_sum(u);
+    if (threadIdx.x == 0) {
+        const float a = act == 0
+            ? g / (1.0f + expf(-g))
+            : 0.5f * g * (1.0f + tanhf(0.7978845608f * (g + 0.044715f * g * g * g)));
+        all_outputs[(size_t)task_id * n + row] = (dst_t)(a * u);
+    }
+}
+
 #define INDEXED_MOE_DST(QNAME, QK, QI, BLOCK, VDR, VEC_DOT, DST, DST_T) \
 extern "C" __global__ void indexed_moe_##QNAME##_##DST( \
     const void * __restrict__ all_weights, \
@@ -82,10 +131,29 @@ extern "C" __global__ void indexed_moe_##QNAME##_##DST( \
         (all_weights, all_inputs, indices, all_outputs, n, k, k_padded, input_dim1); \
 }
 
+#define INDEXED_MOE_GLU(QNAME, QK, QI, BLOCK, VDR, VEC_DOT, DST, DST_T) \
+extern "C" __global__ void indexed_moe_glu_##QNAME##_##DST( \
+    const void * __restrict__ gate_weights, \
+    const void * __restrict__ up_weights, \
+    const void * __restrict__ all_inputs, \
+    const unsigned int * __restrict__ indices, \
+    DST_T * __restrict__ all_outputs, \
+    const int n, \
+    const int k, \
+    const int k_padded, \
+    const int input_dim1, \
+    const int act) { \
+    indexed_moe_glu<QK, QI, BLOCK, VDR, VEC_DOT, DST_T> \
+        (gate_weights, up_weights, all_inputs, indices, all_outputs, n, k, k_padded, input_dim1, act); \
+}
+
 #define INDEXED_MOE_ALL_DST(QNAME, QK, QI, BLOCK, VDR, VEC_DOT) \
 INDEXED_MOE_DST(QNAME, QK, QI, BLOCK, VDR, VEC_DOT, f32, float) \
 INDEXED_MOE_DST(QNAME, QK, QI, BLOCK, VDR, VEC_DOT, f16, __half) \
-INDEXED_MOE_DST(QNAME, QK, QI, BLOCK, VDR, VEC_DOT, bf16, __nv_bfloat16)
+INDEXED_MOE_DST(QNAME, QK, QI, BLOCK, VDR, VEC_DOT, bf16, __nv_bfloat16) \
+INDEXED_MOE_GLU(QNAME, QK, QI, BLOCK, VDR, VEC_DOT, f32, float) \
+INDEXED_MOE_GLU(QNAME, QK, QI, BLOCK, VDR, VEC_DOT, f16, __half) \
+INDEXED_MOE_GLU(QNAME, QK, QI, BLOCK, VDR, VEC_DOT, bf16, __nv_bfloat16)
 
 INDEXED_MOE_ALL_DST(q4_0, QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1)
 INDEXED_MOE_ALL_DST(q4_1, QK4_1, QI4_1, block_q4_1, VDR_Q4_1_Q8_1_MMVQ, vec_dot_q4_1_q8_1)
