@@ -1,7 +1,10 @@
 use crate::layout::LayoutRelation;
 use crate::op::{BackpropOp, Op};
 use crate::tensor::from_storage;
-use crate::{bail, CpuStorage, CudaStorage, Layout, MetalStorage, Result, Shape, Storage, Tensor};
+use crate::{
+    bail, CpuStorage, CudaStorage, Layout, MetalStorage, Result, RocmStorage, Shape, Storage,
+    Tensor,
+};
 use std::sync::Arc;
 
 /// Unary ops that can be defined in user-land.
@@ -30,6 +33,12 @@ pub trait CustomOp1 {
     ) -> Result<(MetalStorage, Shape)> {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
+        ))
+    }
+
+    fn rocm_fwd(&self, _storage: &RocmStorage, _layout: &Layout) -> Result<(RocmStorage, Shape)> {
+        Err(crate::Error::Rocm(
+            format!("no rocm implementation for {}", self.name()).into(),
         ))
     }
 
@@ -79,6 +88,18 @@ pub trait CustomOp2 {
     ) -> Result<(MetalStorage, Shape)> {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
+        ))
+    }
+
+    fn rocm_fwd(
+        &self,
+        _: &RocmStorage,
+        _: &Layout,
+        _: &RocmStorage,
+        _: &Layout,
+    ) -> Result<(RocmStorage, Shape)> {
+        Err(crate::Error::Rocm(
+            format!("no rocm implementation for {}", self.name()).into(),
         ))
     }
 
@@ -137,6 +158,20 @@ pub trait CustomOp3 {
     ) -> Result<(MetalStorage, Shape)> {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
+        ))
+    }
+
+    fn rocm_fwd(
+        &self,
+        _: &RocmStorage,
+        _: &Layout,
+        _: &RocmStorage,
+        _: &Layout,
+        _: &RocmStorage,
+        _: &Layout,
+    ) -> Result<(RocmStorage, Shape)> {
+        Err(crate::Error::Rocm(
+            format!("no rocm implementation for {}", self.name()).into(),
         ))
     }
 
@@ -271,6 +306,12 @@ pub trait InplaceOp1 {
             format!("no metal implementation for {}", self.name()).into(),
         ))
     }
+
+    fn rocm_fwd(&self, _storage: &mut RocmStorage, _layout: &Layout) -> Result<()> {
+        Err(crate::Error::Rocm(
+            format!("no rocm implementation for {}", self.name()).into(),
+        ))
+    }
 }
 
 /// In-place ops that can be defined in user-land.
@@ -334,6 +375,16 @@ pub trait InplaceOpN<const N: usize> {
         bail!("no metal implementation for {}", self.name())
     }
 
+    fn rocm_fwd(
+        &self,
+        dst: &mut RocmStorage,
+        dst_l: &Layout,
+        srcs: [(&RocmStorage, &Layout); N],
+    ) -> Result<()> {
+        let _ = (dst, dst_l, srcs);
+        bail!("no rocm implementation for {}", self.name())
+    }
+
     fn metal_fwd_aliased(
         &self,
         dst: &mut MetalStorage,
@@ -342,6 +393,16 @@ pub trait InplaceOpN<const N: usize> {
     ) -> Result<()> {
         let _ = (dst, dst_l, srcs);
         bail!("no aliased metal implementation for {}", self.name())
+    }
+
+    fn rocm_fwd_aliased(
+        &self,
+        dst: &mut RocmStorage,
+        dst_l: &Layout,
+        srcs: [(Src<'_, RocmStorage>, &Layout); N],
+    ) -> Result<()> {
+        let _ = (dst, dst_l, srcs);
+        bail!("no aliased rocm implementation for {}", self.name())
     }
 }
 
@@ -428,6 +489,7 @@ impl<C: InplaceOp1> InplaceOpN<0> for C {
     forward_op1!(cpu_fwd, cpu_fwd_aliased, CpuStorage);
     forward_op1!(cuda_fwd, cuda_fwd_aliased, CudaStorage);
     forward_op1!(metal_fwd, metal_fwd_aliased, MetalStorage);
+    forward_op1!(rocm_fwd, rocm_fwd_aliased, RocmStorage);
 }
 
 macro_rules! forward_op2 {
@@ -467,6 +529,7 @@ impl<C: InplaceOp2> InplaceOpN<1> for C {
     forward_op2!(cpu_fwd, cpu_fwd_aliased, CpuStorage);
     forward_op2!(cuda_fwd, cuda_fwd_aliased, CudaStorage);
     forward_op2!(metal_fwd, metal_fwd_aliased, MetalStorage);
+    forward_op2!(rocm_fwd, rocm_fwd_aliased, RocmStorage);
 }
 
 pub trait InplaceOp2 {
@@ -504,6 +567,19 @@ pub trait InplaceOp2 {
         _ = (s1, l1, s2, l2);
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
+        ))
+    }
+
+    fn rocm_fwd(
+        &self,
+        s1: &mut RocmStorage,
+        l1: &Layout,
+        s2: &RocmStorage,
+        l2: &Layout,
+    ) -> Result<()> {
+        _ = (s1, l1, s2, l2);
+        Err(crate::Error::Rocm(
+            format!("no rocm implementation for {}", self.name()).into(),
         ))
     }
 }
@@ -547,6 +623,7 @@ impl<C: InplaceOp3> InplaceOpN<2> for C {
     forward_op3!(cpu_fwd, cpu_fwd_aliased, CpuStorage);
     forward_op3!(cuda_fwd, cuda_fwd_aliased, CudaStorage);
     forward_op3!(metal_fwd, metal_fwd_aliased, MetalStorage);
+    forward_op3!(rocm_fwd, rocm_fwd_aliased, RocmStorage);
 }
 
 pub trait InplaceOp3 {
@@ -593,6 +670,20 @@ pub trait InplaceOp3 {
     ) -> Result<()> {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
+        ))
+    }
+
+    fn rocm_fwd(
+        &self,
+        _: &mut RocmStorage,
+        _: &Layout,
+        _: &RocmStorage,
+        _: &Layout,
+        _: &RocmStorage,
+        _: &Layout,
+    ) -> Result<()> {
+        Err(crate::Error::Rocm(
+            format!("no rocm implementation for {}", self.name()).into(),
         ))
     }
 }

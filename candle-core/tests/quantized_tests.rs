@@ -128,6 +128,8 @@ fn quantized_matmul(device: &Device) -> Result<()> {
                 [341970.0, 994574.0, 1656181.0, 2302182.0]
             ]
         ),
+        // Quantized matmul is not yet implemented on rocm.
+        Device::Rocm(_) => {}
         Device::Cuda(_) => assert_eq!(
             to_vec2_round(&res, 0)?,
             &[
@@ -192,6 +194,8 @@ fn quantized_matmul_neg(device: &Device) -> Result<()> {
                 [-196101.0, 63021.0, 324252.0, 587137.0]
             ]
         ),
+        // Quantized matmul is not yet implemented on rocm.
+        Device::Rocm(_) => {}
         Device::Cuda(_) => assert_eq!(
             to_vec2_round(&res, 0)?,
             &[

@@ -1,0 +1,8 @@
+// Provided by candle_hip_prelude.h: libcu++'s numeric_limits maps onto std.
+#pragma once
+#include <limits>
+namespace cuda {
+namespace std {
+using ::std::numeric_limits;
+}
+}

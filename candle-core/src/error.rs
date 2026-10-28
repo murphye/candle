@@ -164,12 +164,18 @@ pub enum Error {
     #[error("the candle crate has not been built with metal support")]
     NotCompiledWithMetalSupport,
 
+    #[error("the candle crate has not been built with rocm support")]
+    NotCompiledWithRocmSupport,
+
     #[error("cannot find tensor {path}")]
     CannotFindTensor { path: String },
 
     // === Wrapped Errors ===
     #[error(transparent)]
     Cuda(Box<dyn std::error::Error + Send + Sync>),
+
+    #[error(transparent)]
+    Rocm(Box<dyn std::error::Error + Send + Sync>),
 
     #[error("Metal error {0}")]
     Metal(#[from] MetalError),

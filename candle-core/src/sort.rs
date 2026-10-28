@@ -107,6 +107,52 @@ mod cuda {
     }
 }
 
+#[cfg(feature = "rocm")]
+mod rocm {
+    use super::*;
+    use crate::rocm_backend::hip::{DeviceRepr, HipSlice, LaunchConfig, ValidAsZeroBits};
+    use crate::rocm_backend::{kernel_name, kernels, RocmStorageSlice as S, WrapErr};
+    use crate::{RocmDevice, WithDType};
+
+    impl crate::rocm_backend::Map1Any for ArgSort {
+        fn f<T: DeviceRepr + WithDType + ValidAsZeroBits, W: Fn(HipSlice<T>) -> S>(
+            &self,
+            src: &HipSlice<T>,
+            dev: &RocmDevice,
+            layout: &crate::Layout,
+            _wrap: W,
+        ) -> Result<S> {
+            let slice = match layout.contiguous_offsets() {
+                None => crate::bail!("input has to be contiguous"),
+                Some((o1, o2)) => src.slice(o1..o2),
+            };
+            let elem_count = layout.shape().elem_count();
+            let dst = unsafe { dev.alloc::<u32>(elem_count)? };
+            let func = if self.asc {
+                dev.get_or_load_func(&kernel_name::<T>("asort_asc"), &kernels::SORT)?
+            } else {
+                dev.get_or_load_func(&kernel_name::<T>("asort_desc"), &kernels::SORT)?
+            };
+            let ncols = self.last_dim;
+            let nrows = elem_count / ncols;
+            let ncols_pad = next_power_of_2(ncols);
+            // Limit block dim to 1024 threads, the maximum workgroup size on AMD gpus.
+            let block_dim = ncols_pad.min(1024);
+            let cfg = LaunchConfig {
+                grid_dim: (nrows as u32, 1, 1),
+                block_dim: (block_dim as u32, 1, 1),
+                shared_mem_bytes: (ncols_pad * std::mem::size_of::<u32>()) as u32,
+            };
+            let mut builder = func.builder();
+            let ncols = ncols as i32;
+            let ncols_pad = ncols_pad as i32;
+            builder.arg(&slice).arg(&dst).arg(&ncols).arg(&ncols_pad);
+            unsafe { builder.launch(cfg) }.w()?;
+            Ok(S::U32(dst))
+        }
+    }
+}
+
 impl crate::CustomOp1 for ArgSort {
     fn name(&self) -> &'static str {
         "argsort"
@@ -163,6 +209,23 @@ impl crate::CustomOp1 for ArgSort {
         let dev = storage.device();
         let slice = self.map(&storage.slice, dev, layout)?;
         let dst = crate::cuda_backend::CudaStorage {
+            slice,
+            device: dev.clone(),
+        };
+        Ok((dst, layout.shape().clone()))
+    }
+
+    #[cfg(feature = "rocm")]
+    fn rocm_fwd(
+        &self,
+        storage: &crate::RocmStorage,
+        layout: &crate::Layout,
+    ) -> Result<(crate::RocmStorage, crate::Shape)> {
+        use crate::backend::BackendStorage;
+        use crate::rocm_backend::Map1Any;
+        let dev = storage.device();
+        let slice = self.map(&storage.slice, dev, layout)?;
+        let dst = crate::rocm_backend::RocmStorage {
             slice,
             device: dev.clone(),
         };

@@ -254,9 +254,31 @@ impl Tensor {
                         };
                         Storage::Cuda(storage)
                     }
+                    #[cfg(feature = "rocm")]
+                    Device::Rocm(device) => {
+                        let mut slice = unsafe { device.alloc::<u8>(data.len())? };
+                        device.memcpy_htod(data, &mut slice)?;
+
+                        let slice = match dtype {
+                            DType::F6E2M3 => crate::rocm_backend::RocmStorageSlice::F6E2M3(slice),
+                            DType::F6E3M2 => crate::rocm_backend::RocmStorageSlice::F6E3M2(slice),
+                            DType::F4 => crate::rocm_backend::RocmStorageSlice::F4(slice),
+                            DType::F8E8M0 => crate::rocm_backend::RocmStorageSlice::F8E8M0(slice),
+                            _ => unreachable!(),
+                        };
+                        let storage = crate::rocm_backend::RocmStorage {
+                            slice,
+                            device: device.clone(),
+                        };
+                        Storage::Rocm(storage)
+                    }
                     #[cfg(not(feature = "cuda"))]
                     Device::Cuda(_) => {
                         return Err(Error::Msg("CUDA support not compiled".to_string()));
+                    }
+                    #[cfg(not(feature = "rocm"))]
+                    Device::Rocm(_) => {
+                        return Err(Error::Msg("ROCm support not compiled".to_string()));
                     }
                     #[cfg(feature = "metal")]
                     Device::Metal(device) => {
@@ -358,9 +380,31 @@ fn convert_dummy(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
             };
             Storage::Cuda(storage)
         }
+        #[cfg(feature = "rocm")]
+        Device::Rocm(device) => {
+            let mut slice = unsafe { device.alloc::<u8>(data.len())? };
+            device.memcpy_htod(data, &mut slice)?;
+
+            let slice = match dtype {
+                DType::F6E2M3 => crate::rocm_backend::RocmStorageSlice::F6E2M3(slice),
+                DType::F6E3M2 => crate::rocm_backend::RocmStorageSlice::F6E3M2(slice),
+                DType::F4 => crate::rocm_backend::RocmStorageSlice::F4(slice),
+                DType::F8E8M0 => crate::rocm_backend::RocmStorageSlice::F8E8M0(slice),
+                _ => unreachable!(),
+            };
+            let storage = crate::rocm_backend::RocmStorage {
+                slice,
+                device: device.clone(),
+            };
+            Storage::Rocm(storage)
+        }
         #[cfg(not(feature = "cuda"))]
         Device::Cuda(_) => {
             return Err(Error::Msg("CUDA support not compiled".to_string()));
+        }
+        #[cfg(not(feature = "rocm"))]
+        Device::Rocm(_) => {
+            return Err(Error::Msg("ROCm support not compiled".to_string()));
         }
         #[cfg(feature = "metal")]
         Device::Metal(device) => {

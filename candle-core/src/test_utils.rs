@@ -21,6 +21,16 @@ macro_rules! test_device {
         fn $test_metal() -> Result<()> {
             $fn_name(&Device::new_metal(0)?)
         }
+
+        // Modules and functions live in different namespaces, so this yields a
+        // `<fn_name>::rocm` test without needing another identifier argument.
+        #[cfg(feature = "rocm")]
+        mod $fn_name {
+            #[test]
+            fn rocm() -> super::Result<()> {
+                super::$fn_name(&super::Device::new_rocm(0)?)
+            }
+        }
     };
 }
 
