@@ -65,10 +65,22 @@ __device__ __forceinline__ int __vsubss4(const int a, const int b) {
 #define __shfl_down_sync(mask, ...) __shfl_down(__VA_ARGS__)
 #define __shfl_up_sync(mask, ...) __shfl_up(__VA_ARGS__)
 
+__device__ __forceinline__ __hip_bfloat162 __floats2bfloat162_rn(float a, float b) {
+    return __halves2bfloat162(__float2bfloat16(a), __float2bfloat16(b));
+}
+
+// cudaFuncSetAttribute accepts any kernel pointer; HIP's takes const void*.
+template <typename Kernel>
+static inline hipError_t candle_func_set_attribute(Kernel kernel, hipFuncAttribute attr,
+                                                   int value) {
+    return hipFuncSetAttribute(reinterpret_cast<const void *>(kernel), attr, value);
+}
+
 // CUDA runtime API names used by host-side kernel launchers.
 #define cudaStream_t hipStream_t
 #define cudaError_t hipError_t
 #define cudaSuccess hipSuccess
+#define cudaErrorInvalidValue hipErrorInvalidValue
 #define cudaGetLastError hipGetLastError
 #define cudaPeekAtLastError hipPeekAtLastError
 #define cudaGetErrorString hipGetErrorString
@@ -78,7 +90,7 @@ __device__ __forceinline__ int __vsubss4(const int a, const int b) {
 #define cudaDevAttrMultiProcessorCount hipDeviceAttributeMultiprocessorCount
 #define cudaFuncAttributes hipFuncAttributes
 #define cudaFuncGetAttributes hipFuncGetAttributes
-#define cudaFuncSetAttribute hipFuncSetAttribute
+#define cudaFuncSetAttribute candle_func_set_attribute
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 #define cudaMemsetAsync hipMemsetAsync
 #define cudaMemcpyAsync hipMemcpyAsync
