@@ -224,6 +224,66 @@ fn dequantize_f16(
     Ok(RocmStorage::wrap_rocm_slice(dst, dev.clone()))
 }
 
+fn dequantize_bf16(
+    data: &PaddedHipSlice,
+    dtype: GgmlDType,
+    elem_count: usize,
+    dev: &RocmDevice,
+) -> Result<RocmStorage> {
+    let nb = elem_count.div_ceil(256);
+    let (kernel_name, is_k, block_dim, num_blocks) = match dtype {
+        GgmlDType::Q4_0 => ("dequantize_block_q4_0_bf16", false, 32, nb),
+        GgmlDType::Q4_1 => ("dequantize_block_q4_1_bf16", false, 32, nb),
+        GgmlDType::Q5_0 => (
+            "dequantize_block_q5_0_bf16",
+            false,
+            CUDA_DEQUANTIZE_BLOCK_SIZE,
+            ceil_div(elem_count, 2 * CUDA_DEQUANTIZE_BLOCK_SIZE),
+        ),
+        GgmlDType::Q5_1 => (
+            "dequantize_block_q5_1_bf16",
+            false,
+            CUDA_DEQUANTIZE_BLOCK_SIZE,
+            ceil_div(elem_count, 2 * CUDA_DEQUANTIZE_BLOCK_SIZE),
+        ),
+        GgmlDType::Q8_0 => ("dequantize_block_q8_0_bf16", false, 32, nb),
+        GgmlDType::Q2K => ("dequantize_block_q2_K_bf16", true, 64, nb),
+        GgmlDType::Q3K => ("dequantize_block_q3_K_bf16", true, 64, nb),
+        GgmlDType::Q4K => ("dequantize_block_q4_K_bf16", true, 32, nb),
+        GgmlDType::Q5K => ("dequantize_block_q5_K_bf16", true, 64, nb),
+        GgmlDType::Q6K => ("dequantize_block_q6_K_bf16", true, 64, nb),
+        GgmlDType::Q8K => ("dequantize_block_q8_K_bf16", true, 32, nb),
+        _ => crate::bail!("unsupported dtype for dequantize {dtype:?}"),
+    };
+    let func = dev.get_or_load_func(kernel_name, &kernels::QUANTIZED)?;
+    let dst = unsafe { dev.alloc::<half::bf16>(elem_count)? };
+    // See e.g.
+    // https://github.com/ggerganov/llama.cpp/blob/cbbd1efa06f8c09f9dff58ff9d9af509cc4c152b/ggml-cuda.cu#L7270
+    let cfg = LaunchConfig {
+        grid_dim: (num_blocks as u32, 1, 1),
+        block_dim: (block_dim as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    if is_k {
+        let mut builder = func.builder();
+        builder.arg(&data.inner);
+        builder.arg(&dst);
+        unsafe { builder.launch(cfg) }.w()?;
+    } else {
+        let nb32 = match dtype {
+            GgmlDType::Q5_0 | GgmlDType::Q5_1 => elem_count,
+            _ => elem_count / 32,
+        };
+        let mut builder = func.builder();
+        builder.arg(&data.inner);
+        builder.arg(&dst);
+        barg!(builder, nb32 as i32);
+        unsafe { builder.launch(cfg) }.w()?;
+    }
+    Ok(RocmStorage::wrap_rocm_slice(dst, dev.clone()))
+}
+
 fn get_rows(
     data: &PaddedHipSlice,
     dtype: GgmlDType,
@@ -703,6 +763,10 @@ impl QRocmStorage {
         dequantize_f16(&self.data, self.dtype, elem_count, self.device())
     }
 
+    pub fn dequantize_bf16(&self, elem_count: usize) -> Result<RocmStorage> {
+        dequantize_bf16(&self.data, self.dtype, elem_count, self.device())
+    }
+
     pub fn quantize(&mut self, src: &RocmStorage) -> Result<()> {
         // Run the quantization on cpu.
         let src = match &src.slice {
@@ -851,8 +915,31 @@ impl QRocmStorage {
         storage: &RocmStorage,
         layout: &crate::Layout,
     ) -> Result<(RocmStorage, crate::Shape)> {
-        // The kernels below take f32 activations: run other dtypes through f32.
         let in_dtype = crate::backend::BackendStorage::dtype(storage);
+        if !FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(result) = self.fast_mmvq(self_shape, storage, layout)? {
+                return Ok(result);
+            }
+        }
+        // Beyond the batch sizes handled by the vector kernels, dequantizing the
+        // weights and running a rocBLAS GEMM is several times faster than MMQ for
+        // half precision activations. rocBLAS f32 GEMMs are slower than MMQ on
+        // RDNA, so f32 activations keep the MMQ path.
+        let rows = match layout.shape().dims() {
+            [b, m, _] => b * m,
+            [m, _] => *m,
+            _ => 0,
+        };
+        if rows > MMVQ_MAX_ROWS
+            && matches!(in_dtype, crate::DType::BF16 | crate::DType::F16)
+            && layout.is_contiguous()
+            && dequantize_kernel_available(self.dtype)
+            && !FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return self.dequantize_gemm(self_shape, storage, layout, in_dtype);
+        }
+
+        // The kernels below take f32 activations: run other dtypes through f32.
         if in_dtype != crate::DType::F32 {
             use crate::backend::BackendStorage;
             let storage = storage.to_dtype(layout, crate::DType::F32)?;
@@ -892,7 +979,174 @@ impl QRocmStorage {
     }
 }
 
+/// Batch sizes up to this use the q8_1 matrix-vector kernels.
+const MMVQ_MAX_ROWS: usize = 8;
+
+fn dequantize_kernel_available(dtype: GgmlDType) -> bool {
+    matches!(
+        dtype,
+        GgmlDType::Q4_0
+            | GgmlDType::Q4_1
+            | GgmlDType::Q5_0
+            | GgmlDType::Q5_1
+            | GgmlDType::Q8_0
+            | GgmlDType::Q2K
+            | GgmlDType::Q3K
+            | GgmlDType::Q4K
+            | GgmlDType::Q5K
+            | GgmlDType::Q6K
+            | GgmlDType::Q8K
+    )
+}
+
+fn mmvq_tag(dtype: GgmlDType) -> Option<&'static str> {
+    Some(match dtype {
+        GgmlDType::Q4_0 => "q4_0",
+        GgmlDType::Q4_1 => "q4_1",
+        GgmlDType::Q5_0 => "q5_0",
+        GgmlDType::Q5_1 => "q5_1",
+        GgmlDType::Q8_0 => "q8_0",
+        GgmlDType::Q2K => "q2_k",
+        GgmlDType::Q3K => "q3_k",
+        GgmlDType::Q4K => "q4_k",
+        GgmlDType::Q5K => "q5_k",
+        GgmlDType::Q6K => "q6_k",
+        _ => return None,
+    })
+}
+
 impl QRocmStorage {
+    /// Matrix-vector product for batches of up to `MMVQ_MAX_ROWS` rows with the
+    /// mmvq_gguf kernels, which read and write the activation dtype directly.
+    /// Returns `None` when the inputs are not supported.
+    fn fast_mmvq(
+        &self,
+        self_shape: &crate::Shape,
+        rhs: &RocmStorage,
+        rhs_l: &crate::Layout,
+    ) -> Result<Option<(RocmStorage, crate::Shape)>> {
+        use crate::backend::BackendStorage;
+        use crate::rocm_backend::RocmStorageSlice as S;
+        let Some(tag) = mmvq_tag(self.dtype) else {
+            return Ok(None);
+        };
+        let (nrows, ncols) = self_shape.dims2()?;
+        let (b_size, k) = match rhs_l.shape().dims() {
+            [b, m, k] => (b * m, *k),
+            [b, k] => (*b, *k),
+            _ => return Ok(None),
+        };
+        if ncols != k || b_size == 0 || b_size > MMVQ_MAX_ROWS {
+            return Ok(None);
+        }
+        let Some((o1, o2)) = rhs_l.contiguous_offsets() else {
+            return Ok(None);
+        };
+        let dev = self.device();
+        let (dst_tag, rhs_ptr) = match &rhs.slice {
+            S::BF16(s) => ("bf16", s.slice(o1..o2).device_ptr()),
+            S::F16(s) => ("f16", s.slice(o1..o2).device_ptr()),
+            S::F32(s) => ("f32", s.slice(o1..o2).device_ptr()),
+            _ => return Ok(None),
+        };
+
+        // Quantize the activations to q8_1, padded to MATRIX_ROW_PADDING.
+        let k_padded = pad(k, MATRIX_ROW_PADDING);
+        let row_bytes = k_padded / GgmlDType::Q8_1.block_size() * GgmlDType::Q8_1.type_size();
+        let y_q8_1 = unsafe { dev.alloc::<u8>(b_size * row_bytes)? };
+        let func = dev.get_or_load_func(
+            &format!("mmvq_gguf_quantize_q8_1_{dst_tag}"),
+            &kernels::MMVQ,
+        )?;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                ceil_div(k_padded, CUDA_QUANTIZE_BLOCK_SIZE) as u32,
+                b_size as u32,
+                1,
+            ),
+            block_dim: (CUDA_QUANTIZE_BLOCK_SIZE as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = func.builder();
+        builder.arg(&rhs_ptr);
+        builder.arg(&y_q8_1);
+        barg!(builder, k as i32, k_padded as i32);
+        unsafe { builder.launch(cfg) }.w()?;
+
+        // Same launch shape as the CUDA launcher: two rows per block past batch 1.
+        let rows_per_block = if b_size <= 1 { 1 } else { 2 };
+        let nwarps = if b_size <= 4 { 4 } else { 2 };
+        let cfg = LaunchConfig {
+            grid_dim: (nrows.div_ceil(rows_per_block) as u32, 1, 1),
+            block_dim: (WARP_SIZE as u32, nwarps, 1),
+            shared_mem_bytes: 0,
+        };
+        let func = dev.get_or_load_func(
+            &format!("mmvq_gguf_{tag}_{dst_tag}_plain_cuda{b_size}"),
+            &kernels::MMVQ,
+        )?;
+        let weights = &self.data.inner;
+        let stride_col_y = (k_padded / GgmlDType::Q8_1.block_size()) as i32;
+        let out = match rhs.dtype() {
+            crate::DType::BF16 => S::BF16(unsafe { dev.alloc::<half::bf16>(nrows * b_size)? }),
+            crate::DType::F16 => S::F16(unsafe { dev.alloc::<f16>(nrows * b_size)? }),
+            _ => S::F32(unsafe { dev.alloc::<f32>(nrows * b_size)? }),
+        };
+        let out_ptr = match &out {
+            S::BF16(s) => s.device_ptr(),
+            S::F16(s) => s.device_ptr(),
+            S::F32(s) => s.device_ptr(),
+            _ => unreachable!(),
+        };
+        let mut builder = func.builder();
+        builder.arg(weights);
+        builder.arg(&y_q8_1);
+        builder.arg(&out_ptr);
+        barg!(builder, k as i32, nrows as i32, stride_col_y, nrows as i32);
+        unsafe { builder.launch(cfg) }.w()?;
+
+        let mut out_shape = rhs_l.shape().dims().to_vec();
+        out_shape.pop();
+        out_shape.push(nrows);
+        let out = RocmStorage {
+            slice: out,
+            device: dev.clone(),
+        };
+        Ok(Some((out, out_shape.into())))
+    }
+
+    /// Dequantizes the weights to the activation dtype and multiplies with a
+    /// rocBLAS GEMM. The dequantized copy is freed on the stream once used.
+    fn dequantize_gemm(
+        &self,
+        self_shape: &crate::Shape,
+        storage: &RocmStorage,
+        layout: &crate::Layout,
+        in_dtype: crate::DType,
+    ) -> Result<(RocmStorage, crate::Shape)> {
+        use crate::backend::BackendStorage;
+        let (n, k) = self_shape.dims2()?;
+        let (b, m, k2) = match layout.shape().dims() {
+            &[b, m, k2] => (b, m, k2),
+            &[m, k2] => (1, m, k2),
+            s => crate::bail!("unexpected shape for input {s:?}"),
+        };
+        if k2 != k {
+            crate::bail!("mismatch on matmul dim {self_shape:?} {:?}", layout.shape())
+        }
+        let weights = match in_dtype {
+            crate::DType::BF16 => self.dequantize_bf16(n * k)?,
+            crate::DType::F16 => self.dequantize_f16(n * k)?,
+            dtype => crate::bail!("unsupported activation dtype {dtype:?} for quantized matmul"),
+        };
+        let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;
+        let out = storage.matmul(&weights, (b, m, n, k), layout, &rhs_l)?;
+        let mut out_shape = layout.shape().dims().to_vec();
+        out_shape.pop();
+        out_shape.push(n);
+        Ok((out, out_shape.into()))
+    }
+
     fn dequantize_matmul_vec(
         &self,
         self_shape: &crate::Shape,
