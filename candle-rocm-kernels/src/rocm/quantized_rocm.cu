@@ -97,3 +97,56 @@ INDEXED_MOE_ALL_DST(q3k, QK_K, QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3
 INDEXED_MOE_ALL_DST(q4k, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1)
 INDEXED_MOE_ALL_DST(q5k, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1)
 INDEXED_MOE_ALL_DST(q6k, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1)
+
+// Dequantization of the 32-element block types to bf16 with one thread per
+// eight outputs and a single 16-byte store, for the grouped MoE prefill path.
+// The generic kernels write two scattered values per thread.
+static __device__ __forceinline__ void dequant8_q8_0(const void *vx, int64_t ib, int part, float *out) {
+    const block_q8_0 *x = (const block_q8_0 *)vx + ib;
+    const float d = __half2float(x->d);
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        out[l] = d * x->qs[8 * part + l];
+    }
+}
+
+static __device__ __forceinline__ void dequant8_q5_0(const void *vx, int64_t ib, int part, float *out) {
+    const block_q5_0 *x = (const block_q5_0 *)vx + ib;
+    const float d = __half2float(x->d);
+    uint32_t qh;
+    memcpy(&qh, x->qh, sizeof(qh));
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const int j = 8 * part + l;
+        const int nibble = j < 16 ? (x->qs[j] & 0x0F) : (x->qs[j - 16] >> 4);
+        const int q = (nibble | (((qh >> j) & 1) << 4)) - 16;
+        out[l] = d * q;
+    }
+}
+
+template <void (*dequant8)(const void *, int64_t, int, float *)>
+static __device__ void dequantize_v8_bf16(const void *__restrict__ vx, __nv_bfloat16 *__restrict__ y,
+                                          const int64_t n_groups) {
+    const int64_t g = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= n_groups) {
+        return;
+    }
+    float v[8];
+    dequant8(vx, g / 4, g % 4, v);
+    __align__(16) __nv_bfloat16 packed[8];
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        packed[l] = __float2bfloat16(v[l]);
+    }
+    *(uint4 *)(y + 8 * g) = *(const uint4 *)packed;
+}
+
+extern "C" __global__ void dequantize_v8_q8_0_bf16(const void *__restrict__ vx, __nv_bfloat16 *__restrict__ y,
+                                                   const int64_t n_groups) {
+    dequantize_v8_bf16<dequant8_q8_0>(vx, y, n_groups);
+}
+
+extern "C" __global__ void dequantize_v8_q5_0_bf16(const void *__restrict__ vx, __nv_bfloat16 *__restrict__ y,
+                                                   const int64_t n_groups) {
+    dequantize_v8_bf16<dequant8_q5_0>(vx, y, n_groups);
+}

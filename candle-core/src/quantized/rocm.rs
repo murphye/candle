@@ -230,6 +230,27 @@ fn dequantize_bf16(
     elem_count: usize,
     dev: &RocmDevice,
 ) -> Result<RocmStorage> {
+    // Q8_0 and Q5_0 have vectorized kernels: one thread per eight outputs.
+    if matches!(dtype, GgmlDType::Q8_0 | GgmlDType::Q5_0) && elem_count % 32 == 0 {
+        let name = match dtype {
+            GgmlDType::Q8_0 => "dequantize_v8_q8_0_bf16",
+            _ => "dequantize_v8_q5_0_bf16",
+        };
+        let func = dev.get_or_load_func(name, &kernels::QUANTIZED)?;
+        let dst = unsafe { dev.alloc::<half::bf16>(elem_count)? };
+        let n_groups = elem_count / 8;
+        let cfg = LaunchConfig {
+            grid_dim: (n_groups.div_ceil(256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = func.builder();
+        builder.arg(&data.inner);
+        builder.arg(&dst);
+        barg!(builder, n_groups as i64);
+        unsafe { builder.launch(cfg) }.w()?;
+        return Ok(RocmStorage::wrap_rocm_slice(dst, dev.clone()));
+    }
     let nb = elem_count.div_ceil(256);
     let (kernel_name, is_k, block_dim, num_blocks) = match dtype {
         GgmlDType::Q4_0 => ("dequantize_block_q4_0_bf16", false, 32, nb),

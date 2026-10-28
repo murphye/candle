@@ -234,8 +234,10 @@ impl Staging {
 }
 
 /// Largest allocation kept in the free-buffer cache. `hipFreeAsync` costs about
-/// 5us of host time, more than a kernel launch, which dominates small ops.
-const CACHE_MAX_BLOCK_BYTES: usize = 64 << 20;
+/// 5us of host time, more than a kernel launch, which dominates small ops, and
+/// `hipMallocAsync` of large blocks can take milliseconds even when the pool
+/// holds enough free memory (the grouped MoE path reuses ~1 GB per layer).
+const CACHE_MAX_BLOCK_BYTES: usize = 1536 << 20;
 /// Upper bound on the bytes held by the cache of one stream.
 const CACHE_MAX_TOTAL_BYTES: usize = 2 << 30;
 
