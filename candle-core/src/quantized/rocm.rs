@@ -1349,6 +1349,37 @@ impl QRocmStorage {
                 out_shape.into(),
             )));
         }
+        // Decode batches also give each row its own warp, reading it once for every column.
+        if b_size > 1 && k <= 8 * nrows {
+            const ROWS_PER_BLOCK: usize = 4;
+            let cfg = LaunchConfig {
+                grid_dim: (nrows.div_ceil(ROWS_PER_BLOCK) as u32, 1, 1),
+                block_dim: (WARP_SIZE as u32, ROWS_PER_BLOCK as u32, 1),
+                shared_mem_bytes: 0,
+            };
+            let func = dev.get_or_load_func(
+                &format!("mmvq_gguf_{tag}_{dst_tag}_warp_row{b_size}"),
+                &kernels::MMVQ,
+            )?;
+            let stride_col_y = (k_padded / GgmlDType::Q8_1.block_size()) as i32;
+            let mut builder = func.builder();
+            builder.arg(weights);
+            builder.arg(&y_q8_1);
+            builder.arg(&out_ptr);
+            barg!(builder, k as i32, nrows as i32, stride_col_y);
+            unsafe { builder.launch(cfg) }.w()?;
+            keep_q8_1();
+            let mut out_shape = rhs_l.shape().dims().to_vec();
+            out_shape.pop();
+            out_shape.push(nrows);
+            return Ok(Some((
+                RocmStorage {
+                    slice: out,
+                    device: dev.clone(),
+                },
+                out_shape.into(),
+            )));
+        }
         let rows_per_block = if b_size <= 1 { 1 } else { 2 };
         let nwarps = if b_size <= 4 { 4 } else { 2 };
         let cfg = LaunchConfig {

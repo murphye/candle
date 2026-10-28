@@ -29,6 +29,60 @@ static __device__ void mmvq_warp_row_impl(const void *__restrict__ vx,
   }
 }
 
+// The same for 2..8 activation columns (decode batches): each warp still owns one
+// weight row and reads it once, keeping one running sum per column.
+template <typename dst_t, int ncols_y, int qk, int qi, typename block_q_t, int vdr,
+          vec_dot_q_cuda_t vec_dot_q_cuda>
+static __device__ void mmvq_warp_row_multi_impl(const void *__restrict__ vx,
+                                                const block_q8_1 *__restrict__ y,
+                                                dst_t *__restrict__ dst, const int ncols_x,
+                                                const int nrows_x, const int stride_col_y) {
+  const int row = blockIdx.x * blockDim.y + threadIdx.y;
+  if (row >= nrows_x) {
+    return;
+  }
+  const int blocks_per_row_x = ncols_x / qk;
+  constexpr int blocks_per_iter = vdr * WARP_SIZE / qi;
+
+  float tmp[ncols_y];
+#pragma unroll
+  for (int j = 0; j < ncols_y; ++j) {
+    tmp[j] = 0.0f;
+  }
+  for (int kbx = threadIdx.x / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    const int kby = kbx * (qk / QK8_1);
+    const int kqs = vdr * (threadIdx.x % (qi / vdr));
+#pragma unroll
+    for (int j = 0; j < ncols_y; ++j) {
+      tmp[j] += vec_dot_q_cuda(vx, &y[j * stride_col_y + kby], row * blocks_per_row_x + kbx, kqs);
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < ncols_y; ++j) {
+    const float v = warp_reduce_sum_f32(tmp[j]);
+    if (threadIdx.x == 0) {
+      dst[j * nrows_x + row] = (dst_t)v;
+    }
+  }
+}
+
+#define MMVQ_WARP_ROW_MULTI_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, dst_tag, dst_c_type, n) \
+  extern "C" __global__ void mmvq_gguf_##tag##_##dst_tag##_warp_row##n(                                     \
+      const void *__restrict__ vx, const void *__restrict__ vy, dst_c_type *__restrict__ dst,               \
+      const int ncols_x, const int nrows_x, const int stride_col_y) {                                       \
+    mmvq_warp_row_multi_impl<dst_c_type, n, qk_val, qi_val, block_q_t, vdr_val, vec_dot>(                   \
+        vx, (const block_q8_1 *)vy, dst, ncols_x, nrows_x, stride_col_y);                                   \
+  }
+
+#define MMVQ_WARP_ROW_MULTI_DST(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, dst_tag, dst_c_type)    \
+  MMVQ_WARP_ROW_MULTI_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, dst_tag, dst_c_type, 2)     \
+  MMVQ_WARP_ROW_MULTI_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, dst_tag, dst_c_type, 3)     \
+  MMVQ_WARP_ROW_MULTI_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, dst_tag, dst_c_type, 4)     \
+  MMVQ_WARP_ROW_MULTI_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, dst_tag, dst_c_type, 5)     \
+  MMVQ_WARP_ROW_MULTI_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, dst_tag, dst_c_type, 6)     \
+  MMVQ_WARP_ROW_MULTI_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, dst_tag, dst_c_type, 7)     \
+  MMVQ_WARP_ROW_MULTI_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, dst_tag, dst_c_type, 8)
+
 #define MMVQ_WARP_ROW_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, dst_tag, dst_c_type) \
   extern "C" __global__ void mmvq_gguf_##tag##_##dst_tag##_warp_row(                              \
       const void *__restrict__ vx, const void *__restrict__ vy, dst_c_type *__restrict__ dst,     \
@@ -40,7 +94,10 @@ static __device__ void mmvq_warp_row_impl(const void *__restrict__ vx,
 #define MMVQ_WARP_ROW_SET(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot)                       \
   MMVQ_WARP_ROW_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, bf16, __nv_bfloat16)      \
   MMVQ_WARP_ROW_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, f16, half)                \
-  MMVQ_WARP_ROW_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, f32, float)
+  MMVQ_WARP_ROW_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, f32, float)               \
+  MMVQ_WARP_ROW_MULTI_DST(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, bf16, __nv_bfloat16)  \
+  MMVQ_WARP_ROW_MULTI_DST(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, f16, half)            \
+  MMVQ_WARP_ROW_MULTI_DST(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, f32, float)
 
 MMVQ_WARP_ROW_SET(q4_0, block_q4_0, QK4_0, QI4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1)
 MMVQ_WARP_ROW_SET(q4_1, block_q4_1, QK4_1, QI4_1, VDR_Q4_1_Q8_1_MMVQ, vec_dot_q4_1_q8_1)
