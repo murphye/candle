@@ -77,8 +77,17 @@ fn indexed_moe_case(
         // One input row per token, shared by its experts, and one row per expert.
         for x_t in [1, topk] {
             let x = Tensor::randn(0f32, 1.0, (tokens, x_t, k), &Device::Cpu)?;
-            let got = qw.indexed_moe_forward(&x.to_device(&rocm)?, &ids_cpu.to_device(&rocm)?)?;
+            let ids_gpu = ids_cpu.to_device(&rocm)?;
+            let got = qw.indexed_moe_forward(&x.to_device(&rocm)?, &ids_gpu)?;
             assert_eq!(got.dims(), &[tokens, topk, n]);
+            // Half precision activations come back in their own dtype.
+            let mut half_outputs = Vec::new();
+            for act in [DType::BF16, DType::F16] {
+                let xh = x.to_dtype(act)?.to_device(&rocm)?;
+                let out = qw.indexed_moe_forward(&xh, &ids_gpu)?;
+                assert_eq!(out.dtype(), act);
+                half_outputs.push((act, out));
+            }
             let mut rows = Vec::new();
             for t in 0..tokens {
                 for j in 0..topk {
@@ -90,6 +99,10 @@ fn indexed_moe_case(
             let expected = Tensor::stack(&rows, 0)?.reshape((tokens, topk, n))?;
             let diff = max_rel_diff(&expected, &got)?;
             assert!(diff < 0.05, "{dtype:?} x_t={x_t}: relative diff {diff}");
+            for (act, out) in half_outputs {
+                let diff = max_rel_diff(&expected, &out)?;
+                assert!(diff < 0.05, "{dtype:?} x_t={x_t} {act:?}: relative diff {diff}");
+            }
         }
     }
     Ok(())

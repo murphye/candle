@@ -932,7 +932,7 @@ impl QTensor {
             .reshape((num_experts * rows, n))?
             .index_select(&dst, 0)?
             .reshape((tokens, topk, n))?
-            .to_dtype(DType::F32)?;
+            .to_dtype(x.dtype())?;
         Ok(Some(out))
     }
 
