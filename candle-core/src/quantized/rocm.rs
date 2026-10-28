@@ -601,6 +601,30 @@ fn indexed_moe_tag(dtype: GgmlDType) -> Option<&'static str> {
     })
 }
 
+/// Whether `dev`'s code object carries the WMMA grouped MoE kernels (gfx11 and gfx12).
+fn moe_gemm_available(dev: &RocmDevice) -> Result<bool> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static AVAILABLE: OnceLock<Mutex<HashMap<usize, bool>>> = OnceLock::new();
+    let cache = AVAILABLE.get_or_init(Default::default);
+    if let Some(&known) = cache.lock().unwrap().get(&dev.ordinal()) {
+        return Ok(known);
+    }
+    let flag = dev.alloc_zeros::<i32>(1)?;
+    let func = dev.get_or_load_func("moe_gemm_available", &kernels::MOE_GEMM)?;
+    let mut builder = func.builder();
+    builder.arg(&flag);
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe { builder.launch(cfg) }.w()?;
+    let known = dev.clone_dtoh(&flag)?[0] == 1;
+    cache.lock().unwrap().insert(dev.ordinal(), known);
+    Ok(known)
+}
+
 impl QRocmStorage {
     /// `x @ w[ids]^T` for weights `[num_experts, n, k]`, input `[batch, topk or 1, k]`
     /// and ids `[batch, topk]`, returning `[batch, topk, n]` in the input dtype.
@@ -632,6 +656,120 @@ impl QRocmStorage {
             crate::bail!("indexed_moe_glu_forward: gate and up weights differ");
         }
         self.indexed_moe(Some((up, act)), self_shape, input, input_l, ids, ids_l)
+    }
+
+    /// Grouped GEMM over the experts for prefill-sized batches: `x: [tokens, 1 | topk, k]`,
+    /// `ids: [tokens, topk]` u32, output `[tokens, topk, n]` in x's dtype. Pairs are sorted by
+    /// expert on the device and every expert's weights are dequantized tile by tile into LDS,
+    /// so nothing waits on the host and no dequantized copy of the experts is made.
+    /// `None` when the weight type or device has no kernel.
+    pub fn moe_gemm_forward(
+        &self,
+        self_shape: &crate::Shape,
+        input: &RocmStorage,
+        input_l: &crate::Layout,
+        ids: &RocmStorage,
+        ids_l: &crate::Layout,
+    ) -> Result<Option<(RocmStorage, crate::Shape)>> {
+        use crate::backend::BackendStorage;
+        use crate::rocm_backend::RocmStorageSlice as S;
+        const BM: usize = 32;
+        const BN: usize = 64;
+        const BK: usize = 32;
+        const MAX_EXPERTS: usize = 1024;
+        let tag = match self.dtype() {
+            GgmlDType::Q4_0 => "q4_0",
+            GgmlDType::Q5_0 => "q5_0",
+            GgmlDType::Q8_0 => "q8_0",
+            GgmlDType::Q4K => "q4k",
+            GgmlDType::Q6K => "q6k",
+            _ => return Ok(None),
+        };
+        let (experts, n, k) = self_shape.dims3()?;
+        let (batch, input_dim1, in_k) = input_l.shape().dims3()?;
+        let (id_batch, topk) = ids_l.shape().dims2()?;
+        if in_k != k
+            || id_batch != batch
+            || (input_dim1 != 1 && input_dim1 != topk)
+            || k % BK != 0
+            || experts > MAX_EXPERTS
+            || ids.dtype() != crate::DType::U32
+        {
+            return Ok(None);
+        }
+        let (Some((x1, x2)), Some((i1, i2))) =
+            (input_l.contiguous_offsets(), ids_l.contiguous_offsets())
+        else {
+            return Ok(None);
+        };
+        let dev = &self.device;
+        if !moe_gemm_available(dev)? {
+            return Ok(None);
+        }
+        let (dst_tag, x_ptr) = match &input.slice {
+            S::BF16(s) => ("bf16", s.slice(x1..x2).device_ptr()),
+            S::F16(s) => ("f16", s.slice(x1..x2).device_ptr()),
+            S::F32(s) => ("f32", s.slice(x1..x2).device_ptr()),
+            _ => return Ok(None),
+        };
+        let ids_ptr = ids.as_rocm_slice::<u32>()?.slice(i1..i2).device_ptr();
+        let pairs = batch * topk;
+        let max_tiles = pairs.div_ceil(BM) + experts;
+
+        let sorted = unsafe { dev.alloc::<u32>(pairs)? };
+        let offsets = unsafe { dev.alloc::<u32>(experts + 1)? };
+        let tiles = unsafe { dev.alloc::<u32>(2 * max_tiles)? };
+        let n_tiles = unsafe { dev.alloc::<u32>(1)? };
+        let route = dev.get_or_load_func("moe_route", &kernels::MOE_GEMM)?;
+        let mut builder = route.builder();
+        builder.arg(&ids_ptr);
+        barg!(builder, pairs as i32, experts as i32);
+        builder.arg(&sorted);
+        builder.arg(&offsets);
+        builder.arg(&tiles);
+        builder.arg(&n_tiles);
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (1024, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { builder.launch(cfg) }.w()?;
+
+        let out_len = pairs * n;
+        let out = match input.dtype() {
+            crate::DType::BF16 => S::BF16(unsafe { dev.alloc::<half::bf16>(out_len)? }),
+            crate::DType::F16 => S::F16(unsafe { dev.alloc::<f16>(out_len)? }),
+            _ => S::F32(unsafe { dev.alloc::<f32>(out_len)? }),
+        };
+        let out_ptr = match &out {
+            S::BF16(s) => s.device_ptr(),
+            S::F16(s) => s.device_ptr(),
+            S::F32(s) => s.device_ptr(),
+            _ => unreachable!(),
+        };
+        let func = dev.get_or_load_func(&format!("moe_gemm_{tag}_{dst_tag}"), &kernels::MOE_GEMM)?;
+        let mut builder = func.builder();
+        builder.arg(&self.data.inner);
+        builder.arg(&x_ptr);
+        builder.arg(&out_ptr);
+        builder.arg(&sorted);
+        builder.arg(&offsets);
+        builder.arg(&tiles);
+        builder.arg(&n_tiles);
+        barg!(builder, n as i32, k as i32, topk as i32, (input_dim1 != 1) as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (n.div_ceil(BN) as u32, max_tiles as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { builder.launch(cfg) }.w()?;
+        Ok(Some((
+            RocmStorage {
+                slice: out,
+                device: dev.clone(),
+            },
+            crate::Shape::from_dims(&[batch, topk, n]),
+        )))
     }
 
     fn indexed_moe(

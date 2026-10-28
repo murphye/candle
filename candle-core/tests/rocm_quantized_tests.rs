@@ -48,7 +48,9 @@ fn quantized_matmul_matches_cpu() -> Result<()> {
 fn indexed_moe_forward_matches_cpu() -> Result<()> {
     // Few pairs use the fused kernel; many pairs use the grouped dequantize + GEMM path.
     indexed_moe_case(8, 64, 512, 5, 2)?;
-    indexed_moe_case(16, 64, 512, 160, 10)
+    indexed_moe_case(16, 64, 512, 160, 10)?;
+    // Partial output tiles and uneven expert loads in the grouped kernel.
+    indexed_moe_case(24, 200, 768, 300, 8)
 }
 
 fn indexed_moe_case(
@@ -98,7 +100,7 @@ fn indexed_moe_case(
             }
             let expected = Tensor::stack(&rows, 0)?.reshape((tokens, topk, n))?;
             let diff = max_rel_diff(&expected, &got)?;
-            assert!(diff < 0.05, "{dtype:?} x_t={x_t}: relative diff {diff}");
+            assert!(diff < 0.05, "{dtype:?} x_t={x_t} experts={num_experts} n={n} k={k} tokens={tokens}: relative diff {diff}");
             for (act, out) in half_outputs {
                 let diff = max_rel_diff(&expected, &out)?;
                 assert!(diff < 0.05, "{dtype:?} x_t={x_t} {act:?}: relative diff {diff}");
@@ -168,3 +170,4 @@ fn reused_activation_quantization_tracks_writes() -> Result<()> {
     }
     Ok(())
 }
+

@@ -931,6 +931,24 @@ impl QTensor {
         {
             return Ok(None);
         }
+        {
+            let x = x.contiguous()?;
+            let ids = ids.to_dtype(DType::U32)?.contiguous()?;
+            let (x_s, x_l) = x.storage_and_layout();
+            let (ids_s, ids_l) = ids.storage_and_layout();
+            if let (Storage::Rocm(x_s), Storage::Rocm(ids_s)) = (&*x_s, &*ids_s) {
+                if let Some((out, shape)) =
+                    storage.moe_gemm_forward(&self.shape, x_s, x_l, ids_s, ids_l)?
+                {
+                    return Ok(Some(crate::tensor::from_storage(
+                        Storage::Rocm(out),
+                        shape,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    )));
+                }
+            }
+        }
         let ids_host = ids.flatten_all()?.to_dtype(DType::U32)?.to_vec1::<u32>()?;
         let mut counts = vec![0usize; num_experts];
         for &e in &ids_host {
