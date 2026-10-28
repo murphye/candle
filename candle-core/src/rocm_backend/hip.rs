@@ -383,6 +383,21 @@ impl HipStream {
         Ok(())
     }
 
+    /// Makes work submitted to `other` from now on wait for the work already
+    /// submitted to this stream, without blocking the host.
+    pub fn order_before(&self, other: &HipStream) -> Result<(), HipError> {
+        self.bind()?;
+        let mut event = std::ptr::null_mut();
+        check(unsafe { sys::hipEventCreateWithFlags(&mut event, sys::hipEventDisableTiming) })?;
+        check(unsafe { sys::hipEventRecord(event, self.raw) })?;
+        other.bind()?;
+        let waited = check(unsafe { sys::hipStreamWaitEvent(other.raw, event, 0) });
+        // Destroying a recorded event is deferred by the runtime until it completes.
+        self.bind()?;
+        check(unsafe { sys::hipEventDestroy(event) })?;
+        waited
+    }
+
     /// `hipMallocAsync`, retrying once with the cache emptied when out of memory.
     fn malloc(&self, bytes: usize) -> Result<u64, HipError> {
         self.bind()?;
@@ -560,8 +575,10 @@ impl HipStream {
         if src.stream.ordinal == self.ordinal {
             self.memcpy_dtod(src, &mut dst)?;
         } else {
-            // Writes to src are ordered on its own stream: wait for them first.
-            src.stream.synchronize()?;
+            // Writes to src are ordered on its own stream: this stream waits for
+            // them, and src's stream waits for the copy before src can be reused.
+            // Neither wait blocks the host.
+            src.stream.order_before(self)?;
             self.bind()?;
             check(unsafe {
                 sys::hipMemcpyPeerAsync(
@@ -573,16 +590,10 @@ impl HipStream {
                     self.raw,
                 )
             })?;
-            // The copy reads src on this stream: order src's later reuse on its
-            // own stream after it.
-            let mut event = std::ptr::null_mut();
-            check(unsafe { sys::hipEventCreateWithFlags(&mut event, sys::hipEventDisableTiming) })?;
-            check(unsafe { sys::hipEventRecord(event, self.raw) })?;
-            src.stream.bind()?;
-            check(unsafe { sys::hipStreamWaitEvent(src.stream.raw, event, 0) })?;
-            check(unsafe { sys::hipEventDestroy(event) })?;
-            self.bind()?;
+            self.order_before(&src.stream)?;
         }
+        // Leave this stream's device current: raw kernel launchers rely on it.
+        self.bind()?;
         Ok(dst)
     }
 }
