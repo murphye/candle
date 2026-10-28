@@ -49,8 +49,10 @@ fn indexed_moe_forward_matches_cpu() -> Result<()> {
     // Few pairs use the fused kernel; many pairs use the grouped dequantize + GEMM path.
     indexed_moe_case(8, 64, 512, 5, 2)?;
     indexed_moe_case(16, 64, 512, 160, 10)?;
-    // Partial output tiles and uneven expert loads in the grouped kernel.
-    indexed_moe_case(24, 200, 768, 300, 8)
+    // Partial output tiles and uneven expert loads in the grouped kernel (tall tiles).
+    indexed_moe_case(24, 200, 768, 300, 8)?;
+    // Few rows per expert: the grouped kernel's wide tiles.
+    indexed_moe_case(64, 200, 512, 200, 8)
 }
 
 fn indexed_moe_case(

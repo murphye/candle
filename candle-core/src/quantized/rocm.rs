@@ -673,8 +673,6 @@ impl QRocmStorage {
     ) -> Result<Option<(RocmStorage, crate::Shape)>> {
         use crate::backend::BackendStorage;
         use crate::rocm_backend::RocmStorageSlice as S;
-        const BM: usize = 32;
-        const BN: usize = 128;
         const BK: usize = 64;
         const MAX_EXPERTS: usize = 1024;
         let tag = match self.dtype() {
@@ -714,7 +712,14 @@ impl QRocmStorage {
         };
         let ids_ptr = ids.as_rocm_slice::<u32>()?.slice(i1..i2).device_ptr();
         let pairs = batch * topk;
-        let max_tiles = pairs.div_ceil(BM) + experts;
+        // Tall tiles once experts average 64+ rows: each weight is then dequantized
+        // about once; below that, wide tiles waste less on padding rows.
+        let (shape, bm, bn) = if pairs >= 64 * experts {
+            ("tall", 128, 64)
+        } else {
+            ("wide", 32, 128)
+        };
+        let max_tiles = pairs.div_ceil(bm) + experts;
 
         let sorted = unsafe { dev.alloc::<u32>(pairs)? };
         let offsets = unsafe { dev.alloc::<u32>(experts + 1)? };
@@ -723,7 +728,7 @@ impl QRocmStorage {
         let route = dev.get_or_load_func("moe_route", &kernels::MOE_GEMM)?;
         let mut builder = route.builder();
         builder.arg(&ids_ptr);
-        barg!(builder, pairs as i32, experts as i32);
+        barg!(builder, pairs as i32, experts as i32, bm as i32);
         builder.arg(&sorted);
         builder.arg(&offsets);
         builder.arg(&tiles);
@@ -747,7 +752,8 @@ impl QRocmStorage {
             S::F32(s) => s.device_ptr(),
             _ => unreachable!(),
         };
-        let func = dev.get_or_load_func(&format!("moe_gemm_{tag}_{dst_tag}"), &kernels::MOE_GEMM)?;
+        let func =
+            dev.get_or_load_func(&format!("moe_gemm_{tag}_{dst_tag}_{shape}"), &kernels::MOE_GEMM)?;
         let mut builder = func.builder();
         builder.arg(&self.data.inner);
         builder.arg(&x_ptr);
@@ -758,7 +764,7 @@ impl QRocmStorage {
         builder.arg(&n_tiles);
         barg!(builder, n as i32, k as i32, topk as i32, (input_dim1 != 1) as i32);
         let cfg = LaunchConfig {
-            grid_dim: (n.div_ceil(BN) as u32, max_tiles as u32, 1),
+            grid_dim: (n.div_ceil(bn) as u32, max_tiles as u32, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };

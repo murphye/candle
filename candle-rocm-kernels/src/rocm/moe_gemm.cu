@@ -10,8 +10,6 @@
 #include <rocwmma/rocwmma.hpp>
 
 
-#define MOE_BM 32
-#define MOE_BN 128
 #define MOE_BK 64
 #define MOE_THREADS 256
 // Rows of the LDS tiles are padded by 8 bf16 to spread banks.
@@ -31,7 +29,7 @@
 // and one (expert, first row) entry per BM-row tile in `tiles`, with the tile count
 // in `n_tiles`. One workgroup; the order of pairs within an expert is unspecified.
 extern "C" __global__ void moe_route(const uint32_t *__restrict__ ids, const int n_pairs, const int n_experts,
-                                     uint32_t *__restrict__ sorted, uint32_t *__restrict__ offsets,
+                                     const int bm, uint32_t *__restrict__ sorted, uint32_t *__restrict__ offsets,
                                      int2 *__restrict__ tiles, uint32_t *__restrict__ n_tiles) {
     __shared__ uint32_t counts[MOE_MAX_EXPERTS];
     __shared__ uint32_t starts[MOE_MAX_EXPERTS];
@@ -52,16 +50,16 @@ extern "C" __global__ void moe_route(const uint32_t *__restrict__ ids, const int
             tile_starts[e] = tile;
             offsets[e] = row;
             row += counts[e];
-            tile += (counts[e] + MOE_BM - 1) / MOE_BM;
+            tile += (counts[e] + bm - 1) / bm;
         }
         offsets[n_experts] = row;
         *n_tiles = tile;
     }
     __syncthreads();
     for (int e = tid; e < n_experts; e += blockDim.x) {
-        const uint32_t ntiles = (counts[e] + MOE_BM - 1) / MOE_BM;
+        const uint32_t ntiles = (counts[e] + bm - 1) / bm;
         for (uint32_t t = 0; t < ntiles; ++t) {
-            tiles[tile_starts[e] + t] = make_int2(e, starts[e] + t * MOE_BM);
+            tiles[tile_starts[e] + t] = make_int2(e, starts[e] + t * bm);
         }
     }
     __syncthreads();
@@ -73,26 +71,37 @@ extern "C" __global__ void moe_route(const uint32_t *__restrict__ ids, const int
 
 // Eight consecutive weights `8 * part .. 8 * part + 7` of quant block `ib`.
 static __device__ __forceinline__ void moe_dequant8_q8_0(const void *vx, int64_t ib, int part, float *out) {
-    const block_q8_0 *x = (const block_q8_0 *)vx + ib;
-    const float d = __half2float(x->d);
+    // 34-byte blocks are only 2-byte aligned, so the quants are read in 16-bit words.
+    const uint16_t *b = (const uint16_t *)((const uint8_t *)vx + ib * (int64_t)sizeof(block_q8_0));
+    const float d = __half2float(__ushort_as_half(b[0]));
+    const uint16_t *qs = b + 1 + 4 * part;
 #pragma unroll
-    for (int l = 0; l < 8; ++l) {
-        out[l] = d * x->qs[8 * part + l];
+    for (int w = 0; w < 4; ++w) {
+        const uint32_t pair = qs[w];
+        out[2 * w] = d * (int8_t)(pair & 0xFF);
+        out[2 * w + 1] = d * (int8_t)(pair >> 8);
     }
 }
 
 static __device__ __forceinline__ void moe_dequant8_q5_0(const void *vx, int64_t ib, int part, float *out) {
-    const block_q5_0 *x = (const block_q5_0 *)vx + ib;
-    const float d = __half2float(x->d);
-    uint32_t qh;
-    memcpy(&qh, x->qh, sizeof(qh));
+    // 22-byte blocks are only 2-byte aligned, so fields are read in 16-bit words.
+    const uint16_t *b = (const uint16_t *)((const uint8_t *)vx + ib * (int64_t)sizeof(block_q5_0));
+    const float d = __half2float(__ushort_as_half(b[0]));
+    const uint32_t qh = (uint32_t)b[1] | ((uint32_t)b[2] << 16);
+    // Weights 0-15 are the low nibbles of qs[0..16], 16-31 the high nibbles.
+    const uint16_t *qs = b + 3 + 4 * (part & 1);
+    const int shift = part >= 2 ? 4 : 0;
+    const uint32_t hbits = qh >> (8 * part);
 #pragma unroll
-    for (int l = 0; l < 8; ++l) {
-        const int j = 8 * part + l;
-        const int nibble = j < 16 ? (x->qs[j] & 0x0F) : (x->qs[j - 16] >> 4);
-        // In int: with qh unsigned the subtraction would wrap.
-        const int q = (nibble | (((qh >> j) & 1) << 4)) - 16;
-        out[l] = d * q;
+    for (int w = 0; w < 4; ++w) {
+        const uint32_t pair = qs[w];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int l = 2 * w + h;
+            const int nibble = (pair >> (8 * h + shift)) & 0x0F;
+            const int q = (int)(nibble | (((hbits >> l) & 1) << 4)) - 16;
+            out[l] = d * q;
+        }
     }
 }
 
@@ -162,7 +171,8 @@ template <> __device__ __forceinline__ __nv_bfloat16 moe_from_float<__nv_bfloat1
 // `x_per_pair` selects x's row: the pair itself ([pairs, k], down projections) or its
 // token (pair / topk, [tokens, k], gate and up). `qk` weights per quant block,
 // `parts` = qk / 8.
-template <typename T, int QK, void (*dequant8)(const void *, int64_t, int, float *)>
+// BM x BN output tiles; eight waves in a (BM / 32) x (8 / (BM / 32)) grid, each owning 32 rows.
+template <typename T, int QK, void (*dequant8)(const void *, int64_t, int, float *), int MOE_BM, int MOE_BN>
 static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict__ x, T *__restrict__ y,
                                 const uint32_t *__restrict__ sorted, const uint32_t *__restrict__ offsets,
                                 const int2 *__restrict__ tiles, const uint32_t *__restrict__ n_tiles,
@@ -196,10 +206,22 @@ static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict_
     }
     __syncthreads();
 
-    // Each wave owns a 32 x 16 column strip: two 16 x 16 accumulators.
-    fragment<accumulator, 16, 16, 16, float32_t> acc[2];
-    fill_fragment(acc[0], 0.0f);
-    fill_fragment(acc[1], 0.0f);
+    // Tall tiles let an expert's rows share one dequantization of its weights; waves
+    // whose rows are all padding skip the MMAs.
+    constexpr int WAVES_M = MOE_BM / 32;
+    constexpr int WAVES_N = (MOE_THREADS / 32) / WAVES_M;
+    constexpr int FN = MOE_BN / WAVES_N / 16;
+    const int wave_m = wave / WAVES_N;
+    const int wave_n = wave % WAVES_N;
+    const bool wave_active = wave_m * 32 < rows;
+    fragment<accumulator, 16, 16, 16, float32_t> acc[2][FN];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+#pragma unroll
+        for (int j = 0; j < FN; ++j) {
+            fill_fragment(acc[i][j], 0.0f);
+        }
+    }
 
     const int blocks_per_row = k / QK;
     const char *wexp = (const char *)w + (int64_t)expert * n * blocks_per_row * block_bytes;
@@ -251,22 +273,37 @@ static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict_
             *(uint4 *)(b_lds + nn * MOE_LDS_K + c) = *(const uint4 *)v;
         }
         __syncthreads();
+        if (wave_active) {
 #pragma unroll
-        for (int kk = 0; kk < MOE_BK; kk += 16) {
-            fragment<matrix_b, 16, 16, 16, bfloat16_t, col_major> b;
-            load_matrix_sync(b, b_lds + (wave * 16) * MOE_LDS_K + kk, MOE_LDS_K);
+            for (int kk = 0; kk < MOE_BK; kk += 16) {
+                fragment<matrix_a, 16, 16, 16, bfloat16_t, row_major> a[2];
+                fragment<matrix_b, 16, 16, 16, bfloat16_t, col_major> b[FN];
 #pragma unroll
-            for (int i = 0; i < 2; ++i) {
-                fragment<matrix_a, 16, 16, 16, bfloat16_t, row_major> a;
-                load_matrix_sync(a, a_lds + (i * 16) * MOE_LDS_K + kk, MOE_LDS_K);
-                mma_sync(acc[i], a, b, acc[i]);
+                for (int i = 0; i < 2; ++i) {
+                    load_matrix_sync(a[i], a_lds + (wave_m * 32 + i * 16) * MOE_LDS_K + kk, MOE_LDS_K);
+                }
+#pragma unroll
+                for (int j = 0; j < FN; ++j) {
+                    load_matrix_sync(b[j], b_lds + (wave_n * FN * 16 + j * 16) * MOE_LDS_K + kk, MOE_LDS_K);
+                }
+#pragma unroll
+                for (int i = 0; i < 2; ++i) {
+#pragma unroll
+                    for (int j = 0; j < FN; ++j) {
+                        mma_sync(acc[i][j], a[i], b[j], acc[i][j]);
+                    }
+                }
             }
         }
         __syncthreads();
     }
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
-        store_matrix_sync(c_lds + (i * 16) * MOE_BN + wave * 16, acc[i], MOE_BN, mem_row_major);
+#pragma unroll
+        for (int j = 0; j < FN; ++j) {
+            store_matrix_sync(c_lds + (wave_m * 32 + i * 16) * MOE_BN + (wave_n * FN + j) * 16, acc[i][j],
+                              MOE_BN, mem_row_major);
+        }
     }
     __syncthreads();
     for (int e = tid; e < MOE_BM * MOE_BN; e += MOE_THREADS) {
@@ -279,13 +316,21 @@ static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict_
 #endif
 }
 
+// `wide` (32 x 128 tiles) suits few rows per expert, `tall` (128 x 64) many.
 #define MOE_GEMM(TAG, QK, BLOCK, DEQ, T, DST)                                                              \
-    extern "C" __global__ void moe_gemm_##TAG##_##DST(                                                     \
+    extern "C" __global__ void moe_gemm_##TAG##_##DST##_wide(                                              \
         const void *w, const T *x, T *y, const uint32_t *sorted, const uint32_t *offsets,                 \
         const int2 *tiles, const uint32_t *n_tiles, const int n, const int k, const int topk,             \
         const int x_per_pair) {                                                                            \
-        moe_gemm<T, QK, DEQ>(w, x, y, sorted, offsets, tiles, n_tiles, n, k, topk, x_per_pair,             \
-                             sizeof(BLOCK));                                                               \
+        moe_gemm<T, QK, DEQ, 32, 128>(w, x, y, sorted, offsets, tiles, n_tiles, n, k, topk, x_per_pair,    \
+                                      sizeof(BLOCK));                                                      \
+    }                                                                                                      \
+    extern "C" __global__ void moe_gemm_##TAG##_##DST##_tall(                                              \
+        const void *w, const T *x, T *y, const uint32_t *sorted, const uint32_t *offsets,                 \
+        const int2 *tiles, const uint32_t *n_tiles, const int n, const int k, const int topk,             \
+        const int x_per_pair) {                                                                            \
+        moe_gemm<T, QK, DEQ, 128, 64>(w, x, y, sorted, offsets, tiles, n_tiles, n, k, topk, x_per_pair,    \
+                                      sizeof(BLOCK));                                                      \
     }
 
 #define MOE_GEMM_ALL_DST(TAG, QK, BLOCK, DEQ)        \
