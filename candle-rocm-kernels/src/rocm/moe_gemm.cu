@@ -87,7 +87,11 @@ template <> __device__ __forceinline__ __nv_bfloat16 moe_from_float<__nv_bfloat1
 // token (pair / topk, [tokens, k], gate and up). `qk` weights per quant block,
 // `parts` = qk / 8.
 // BM x BN output tiles; eight waves in a (BM / 32) x (8 / (BM / 32)) grid, each owning 32 rows.
-template <typename T, int QK, void (*dequant8)(const void *, int64_t, int, float *), int MOE_BM, int MOE_BN>
+// The K loop is a two-stage pipeline: a step's x rows and raw weight words are loaded into
+// registers while the previous step's tile is written to LDS and multiplied, so the global
+// load latency hides behind the MMAs instead of stalling every step.
+template <typename T, int QK, void (*load8)(const void *, int64_t, int, moe_raw8 &),
+          void (*conv8)(const moe_raw8 &, int, float *), int MOE_BM, int MOE_BN>
 static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict__ x, T *__restrict__ y,
                                 const uint32_t *__restrict__ sorted, const uint32_t *__restrict__ offsets,
                                 const int2 *__restrict__ tiles, const uint32_t *__restrict__ n_tiles,
@@ -141,9 +145,17 @@ static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict_
     const int blocks_per_row = k / QK;
     const char *wexp = (const char *)w + (int64_t)expert * n * blocks_per_row * block_bytes;
 
-    for (int k0 = 0; k0 < k; k0 += MOE_BK) {
-        // A: BM rows x BK in groups of eight; bf16 rows are copied with one 16-byte load.
-        for (int g = tid; g < MOE_BM * (MOE_BK / 8); g += MOE_THREADS) {
+    // Per thread and K step: A_GROUPS 16-byte pieces of x rows, B_GROUPS eight-weight pieces.
+    constexpr int A_GROUPS = MOE_BM * (MOE_BK / 8) / MOE_THREADS;
+    constexpr int B_GROUPS = MOE_BN * (MOE_BK / 8) / MOE_THREADS;
+    static_assert(A_GROUPS * MOE_THREADS == MOE_BM * (MOE_BK / 8), "the A tile divides over the threads");
+    static_assert(B_GROUPS * MOE_THREADS == MOE_BN * (MOE_BK / 8), "the B tile divides over the threads");
+
+    // Global loads of one K step into registers.
+    auto load_step = [&](const int k0, uint4 (&a_reg)[A_GROUPS], moe_raw8 (&b_reg)[B_GROUPS]) {
+#pragma unroll
+        for (int i = 0; i < A_GROUPS; ++i) {
+            const int g = tid + i * MOE_THREADS;
             const int r = g / (MOE_BK / 8);
             const int c = (g % (MOE_BK / 8)) * 8;
             uint4 packed = make_uint4(0, 0, 0, 0);
@@ -162,19 +174,38 @@ static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict_
                     packed = *(const uint4 *)v;
                 }
             }
-            *(uint4 *)(a_lds + r * MOE_LDS_K + c) = packed;
+            a_reg[i] = packed;
         }
-        // B: BN weight rows x BK, two 8-weight groups per thread.
 #pragma unroll
-        for (int g = tid; g < MOE_BN * (MOE_BK / 8); g += MOE_THREADS) {
+        for (int i = 0; i < B_GROUPS; ++i) {
+            const int g = tid + i * MOE_THREADS;
+            const int nn = g / (MOE_BK / 8);
+            const int c = (g % (MOE_BK / 8)) * 8;
+            if (n0 + nn < n) {
+                const int kk = k0 + c;
+                const int64_t ib = (int64_t)(n0 + nn) * blocks_per_row + kk / QK;
+                load8(wexp, ib, (kk % QK) / 8, b_reg[i]);
+            }
+        }
+    };
+    // The registers of K step `k0` into the LDS tiles, weights converted to bf16.
+    auto store_step = [&](const int k0, const uint4 (&a_reg)[A_GROUPS], const moe_raw8 (&b_reg)[B_GROUPS]) {
+#pragma unroll
+        for (int i = 0; i < A_GROUPS; ++i) {
+            const int g = tid + i * MOE_THREADS;
+            const int r = g / (MOE_BK / 8);
+            const int c = (g % (MOE_BK / 8)) * 8;
+            *(uint4 *)(a_lds + r * MOE_LDS_K + c) = a_reg[i];
+        }
+#pragma unroll
+        for (int i = 0; i < B_GROUPS; ++i) {
+            const int g = tid + i * MOE_THREADS;
             const int nn = g / (MOE_BK / 8);
             const int c = (g % (MOE_BK / 8)) * 8;
             __align__(16) bfloat16_t v[8];
             if (n0 + nn < n) {
-                const int kk = k0 + c;
-                const int64_t ib = (int64_t)(n0 + nn) * blocks_per_row + kk / QK;
                 float f[8];
-                dequant8(wexp, ib, (kk % QK) / 8, f);
+                conv8(b_reg[i], ((k0 + c) % QK) / 8, f);
 #pragma unroll
                 for (int l = 0; l < 8; ++l) {
                     v[l] = static_cast<bfloat16_t>(f[l]);
@@ -187,7 +218,22 @@ static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict_
             }
             *(uint4 *)(b_lds + nn * MOE_LDS_K + c) = *(const uint4 *)v;
         }
+    };
+
+    uint4 a_cur[A_GROUPS];
+    moe_raw8 b_cur[B_GROUPS];
+    load_step(0, a_cur, b_cur);
+    for (int k0 = 0; k0 < k; k0 += MOE_BK) {
+        store_step(k0, a_cur, b_cur);
         __syncthreads();
+        // The next step's loads are issued after the LDS write, so the wait for this step's
+        // registers above does not also wait for them; they land during the MMAs below.
+        const bool more = k0 + MOE_BK < k;
+        uint4 a_nxt[A_GROUPS];
+        moe_raw8 b_nxt[B_GROUPS];
+        if (more) {
+            load_step(k0 + MOE_BK, a_nxt, b_nxt);
+        }
         if (wave_active) {
 #pragma unroll
             for (int kk = 0; kk < MOE_BK; kk += 16) {
@@ -211,6 +257,16 @@ static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict_
             }
         }
         __syncthreads();
+        if (more) {
+#pragma unroll
+            for (int i = 0; i < A_GROUPS; ++i) {
+                a_cur[i] = a_nxt[i];
+            }
+#pragma unroll
+            for (int i = 0; i < B_GROUPS; ++i) {
+                b_cur[i] = b_nxt[i];
+            }
+        }
     }
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
@@ -232,32 +288,32 @@ static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict_
 }
 
 // `wide` (32 x 128 tiles) suits few rows per expert, `tall` (128 x 64) many.
-#define MOE_GEMM(TAG, QK, BLOCK, DEQ, T, DST)                                                              \
+#define MOE_GEMM(TAG, QK, BLOCK, LOAD, CONV, T, DST)                                                              \
     extern "C" __global__ void moe_gemm_##TAG##_##DST##_wide(                                              \
         const void *w, const T *x, T *y, const uint32_t *sorted, const uint32_t *offsets,                 \
         const int2 *tiles, const uint32_t *n_tiles, const int n, const int k, const int topk,             \
         const int x_per_pair) {                                                                            \
-        moe_gemm<T, QK, DEQ, 32, 128>(w, x, y, sorted, offsets, tiles, n_tiles, n, k, topk, x_per_pair,    \
+        moe_gemm<T, QK, LOAD, CONV, 32, 128>(w, x, y, sorted, offsets, tiles, n_tiles, n, k, topk, x_per_pair,    \
                                       sizeof(BLOCK));                                                      \
     }                                                                                                      \
     extern "C" __global__ void moe_gemm_##TAG##_##DST##_tall(                                              \
         const void *w, const T *x, T *y, const uint32_t *sorted, const uint32_t *offsets,                 \
         const int2 *tiles, const uint32_t *n_tiles, const int n, const int k, const int topk,             \
         const int x_per_pair) {                                                                            \
-        moe_gemm<T, QK, DEQ, 128, 64>(w, x, y, sorted, offsets, tiles, n_tiles, n, k, topk, x_per_pair,    \
+        moe_gemm<T, QK, LOAD, CONV, 128, 64>(w, x, y, sorted, offsets, tiles, n_tiles, n, k, topk, x_per_pair,    \
                                       sizeof(BLOCK));                                                      \
     }
 
-#define MOE_GEMM_ALL_DST(TAG, QK, BLOCK, DEQ)        \
-    MOE_GEMM(TAG, QK, BLOCK, DEQ, float, f32)        \
-    MOE_GEMM(TAG, QK, BLOCK, DEQ, __half, f16)       \
-    MOE_GEMM(TAG, QK, BLOCK, DEQ, __nv_bfloat16, bf16)
+#define MOE_GEMM_ALL_DST(TAG, QK, BLOCK, LOAD, CONV)        \
+    MOE_GEMM(TAG, QK, BLOCK, LOAD, CONV, float, f32)        \
+    MOE_GEMM(TAG, QK, BLOCK, LOAD, CONV, __half, f16)       \
+    MOE_GEMM(TAG, QK, BLOCK, LOAD, CONV, __nv_bfloat16, bf16)
 
-MOE_GEMM_ALL_DST(q4_0, QK4_0, block_q4_0, moe_dequant8_q4_0)
-MOE_GEMM_ALL_DST(q5_0, QK5_0, block_q5_0, moe_dequant8_q5_0)
-MOE_GEMM_ALL_DST(q8_0, QK8_0, block_q8_0, moe_dequant8_q8_0)
-MOE_GEMM_ALL_DST(q4k, QK_K, block_q4_K, moe_dequant8_q4_K)
-MOE_GEMM_ALL_DST(q6k, QK_K, block_q6_K, moe_dequant8_q6_K)
+MOE_GEMM_ALL_DST(q4_0, QK4_0, block_q4_0, moe_load8_q4_0, moe_conv8_q4_0)
+MOE_GEMM_ALL_DST(q5_0, QK5_0, block_q5_0, moe_load8_q5_0, moe_conv8_q5_0)
+MOE_GEMM_ALL_DST(q8_0, QK8_0, block_q8_0, moe_load8_q8_0, moe_conv8_q8_0)
+MOE_GEMM_ALL_DST(q4k, QK_K, block_q4_K, moe_load8_q4_K, moe_conv8_q4_K)
+MOE_GEMM_ALL_DST(q6k, QK_K, block_q6_K, moe_load8_q6_K, moe_conv8_q6_K)
 
 // Writes 1 when this code object has the WMMA kernels above, 0 otherwise.
 extern "C" __global__ void moe_gemm_available(int *out) { *out = MOE_HAS_WMMA; }

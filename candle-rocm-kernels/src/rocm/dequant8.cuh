@@ -1,6 +1,19 @@
 // Eight-weight dequantizers for GGUF quant blocks, shared by the kernels that dequantize
 // weights on the fly. Needs the block definitions of quantized.cu.
+//
+// Two forms: `moe_dequant8_*` loads and converts in one go; `moe_load8_*` + `moe_conv8_*`
+// split the global loads from the arithmetic, so a kernel can issue the loads of its next
+// tile before it computes on the current one.
 #pragma once
+
+// The raw words eight weights of one quant block need, in the type's own packing.
+struct moe_raw8 {
+    uint32_t w[6];
+};
+
+static __device__ __forceinline__ uint32_t moe_pack16(const uint16_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 16);
+}
 
 // Eight consecutive weights `8 * part .. 8 * part + 7` of quant block `ib`.
 static __device__ __forceinline__ void moe_dequant8_q8_0(const void *vx, int64_t ib, int part, float *out) {
@@ -13,6 +26,23 @@ static __device__ __forceinline__ void moe_dequant8_q8_0(const void *vx, int64_t
         const uint32_t pair = qs[w];
         out[2 * w] = d * (int8_t)(pair & 0xFF);
         out[2 * w + 1] = d * (int8_t)(pair >> 8);
+    }
+}
+
+static __device__ __forceinline__ void moe_load8_q8_0(const void *vx, int64_t ib, int part, moe_raw8 &r) {
+    const uint16_t *b = (const uint16_t *)((const uint8_t *)vx + ib * (int64_t)sizeof(block_q8_0));
+    const uint16_t *qs = b + 1 + 4 * part;
+    r.w[0] = b[0];
+    r.w[1] = moe_pack16(qs);
+    r.w[2] = moe_pack16(qs + 2);
+}
+
+static __device__ __forceinline__ void moe_conv8_q8_0(const moe_raw8 &r, int part, float *out) {
+    const float d = __half2float(__ushort_as_half((uint16_t)r.w[0]));
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const uint32_t word = l < 4 ? r.w[1] : r.w[2];
+        out[l] = d * (int8_t)((word >> (8 * (l % 4))) & 0xFF);
     }
 }
 
@@ -38,6 +68,28 @@ static __device__ __forceinline__ void moe_dequant8_q5_0(const void *vx, int64_t
     }
 }
 
+static __device__ __forceinline__ void moe_load8_q5_0(const void *vx, int64_t ib, int part, moe_raw8 &r) {
+    const uint16_t *b = (const uint16_t *)((const uint8_t *)vx + ib * (int64_t)sizeof(block_q5_0));
+    const uint16_t *qs = b + 3 + 4 * (part & 1);
+    r.w[0] = b[0];
+    r.w[1] = moe_pack16(b + 1);
+    r.w[2] = moe_pack16(qs);
+    r.w[3] = moe_pack16(qs + 2);
+}
+
+static __device__ __forceinline__ void moe_conv8_q5_0(const moe_raw8 &r, int part, float *out) {
+    const float d = __half2float(__ushort_as_half((uint16_t)r.w[0]));
+    const int shift = part >= 2 ? 4 : 0;
+    const uint32_t hbits = r.w[1] >> (8 * part);
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const uint32_t word = l < 4 ? r.w[2] : r.w[3];
+        const int nibble = (word >> (8 * (l % 4) + shift)) & 0x0F;
+        const int q = (int)(nibble | (((hbits >> l) & 1) << 4)) - 16;
+        out[l] = d * q;
+    }
+}
+
 static __device__ __forceinline__ void moe_dequant8_q4_0(const void *vx, int64_t ib, int part, float *out) {
     const block_q4_0 *x = (const block_q4_0 *)vx + ib;
     const float d = __half2float(x->d);
@@ -45,6 +97,26 @@ static __device__ __forceinline__ void moe_dequant8_q4_0(const void *vx, int64_t
     for (int l = 0; l < 8; ++l) {
         const int j = 8 * part + l;
         const int nibble = j < 16 ? (x->qs[j] & 0x0F) : (x->qs[j - 16] >> 4);
+        out[l] = d * (nibble - 8);
+    }
+}
+
+static __device__ __forceinline__ void moe_load8_q4_0(const void *vx, int64_t ib, int part, moe_raw8 &r) {
+    // 18-byte blocks are 2-byte aligned; parts 0/2 and 1/3 share the same eight quant bytes.
+    const uint16_t *b = (const uint16_t *)((const uint8_t *)vx + ib * (int64_t)sizeof(block_q4_0));
+    const uint16_t *qs = b + 1 + 4 * (part & 1);
+    r.w[0] = b[0];
+    r.w[1] = moe_pack16(qs);
+    r.w[2] = moe_pack16(qs + 2);
+}
+
+static __device__ __forceinline__ void moe_conv8_q4_0(const moe_raw8 &r, int part, float *out) {
+    const float d = __half2float(__ushort_as_half((uint16_t)r.w[0]));
+    const int shift = part >= 2 ? 4 : 0;
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const uint32_t word = l < 4 ? r.w[1] : r.w[2];
+        const int nibble = (word >> (8 * (l % 4) + shift)) & 0x0F;
         out[l] = d * (nibble - 8);
     }
 }
@@ -63,6 +135,41 @@ static __device__ __forceinline__ void moe_dequant8_q4_K(const void *vx, int64_t
 #pragma unroll
     for (int l = 0; l < 8; ++l) {
         const uint32_t word = l < 4 ? qq.x : qq.y;
+        out[l] = d * ((word >> (8 * (l % 4) + shift)) & 0x0F) - dmin;
+    }
+}
+
+static __device__ __forceinline__ void moe_load8_q4_K(const void *vx, int64_t ib, int part, moe_raw8 &r) {
+    // dm (4 bytes), the twelve scale bytes and the eight quant bytes: all 4-byte aligned.
+    const uint32_t *b = (const uint32_t *)((const uint8_t *)vx + ib * (int64_t)sizeof(block_q4_K));
+    const int sub = part / 4;
+    const uint2 qq = *(const uint2 *)((const uint8_t *)(b + 4) + 32 * (sub / 2) + 8 * (part % 4));
+    r.w[0] = b[0];
+    r.w[1] = b[1];
+    r.w[2] = b[2];
+    r.w[3] = b[3];
+    r.w[4] = qq.x;
+    r.w[5] = qq.y;
+}
+
+static __device__ __forceinline__ void moe_conv8_q4_K(const moe_raw8 &r, int part, float *out) {
+    const int sub = part / 4;
+    // get_scale_min_k4 over the scale bytes held in w[1..3].
+    const auto q = [&](int i) -> uint32_t { return (r.w[1 + i / 4] >> (8 * (i % 4))) & 0xFF; };
+    uint32_t sc, m;
+    if (sub < 4) {
+        sc = q(sub) & 63;
+        m = q(sub + 4) & 63;
+    } else {
+        sc = (q(sub + 4) & 0xF) | ((q(sub - 4) >> 6) << 4);
+        m = (q(sub + 4) >> 4) | ((q(sub) >> 6) << 4);
+    }
+    const float d = __half2float(__ushort_as_half((uint16_t)r.w[0])) * sc;
+    const float dmin = __half2float(__ushort_as_half((uint16_t)(r.w[0] >> 16))) * m;
+    const int shift = 4 * (sub & 1);
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const uint32_t word = l < 4 ? r.w[4] : r.w[5];
         out[l] = d * ((word >> (8 * (l % 4) + shift)) & 0x0F) - dmin;
     }
 }
@@ -94,3 +201,35 @@ static __device__ __forceinline__ void moe_dequant8_q6_K(const void *vx, int64_t
     }
 }
 
+static __device__ __forceinline__ void moe_load8_q6_K(const void *vx, int64_t ib, int part, moe_raw8 &r) {
+    const block_q6_K *x = (const block_q6_K *)vx + ib;
+    const int j = 8 * part;
+    const int half = j / 128;
+    const int jj = j % 128;
+    const int quarter = jj / 32;
+    const int lane0 = jj % 32;
+    const uint16_t *ql = (const uint16_t *)(x->ql + 64 * half + lane0 + 32 * (quarter & 1));
+    const uint16_t *qh = (const uint16_t *)(x->qh + 32 * half + lane0);
+    const uint32_t scale = (uint32_t)(uint8_t)x->scales[8 * half + 2 * quarter + lane0 / 16];
+    r.w[0] = (uint32_t)__half_as_ushort(x->d) | (scale << 16);
+    r.w[1] = moe_pack16(ql);
+    r.w[2] = moe_pack16(ql + 2);
+    r.w[3] = moe_pack16(qh);
+    r.w[4] = moe_pack16(qh + 2);
+}
+
+static __device__ __forceinline__ void moe_conv8_q6_K(const moe_raw8 &r, int part, float *out) {
+    const int quarter = (part % 16) / 4;
+    const float d = __half2float(__ushort_as_half((uint16_t)r.w[0])) * (float)(int8_t)(r.w[0] >> 16);
+    const int lshift = quarter >= 2 ? 4 : 0;
+    const int hshift = 2 * quarter;
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const uint32_t l2 = (l < 4 ? r.w[1] : r.w[2]) >> (16 * ((l / 2) % 2));
+        const uint32_t h2 = (l < 4 ? r.w[3] : r.w[4]) >> (16 * ((l / 2) % 2));
+        const int b = l % 2;
+        const int low = (l2 >> (8 * b + lshift)) & 0x0F;
+        const int high = (h2 >> (8 * b + hshift)) & 3;
+        out[l] = d * ((low | (high << 4)) - 32);
+    }
+}

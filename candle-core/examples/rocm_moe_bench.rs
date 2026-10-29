@@ -5,7 +5,9 @@ use candle_core::{DType, Device, Tensor};
 /// Times the indexed MoE kernel at Qwen3.8-Flash-Next (REAP-288) expert shapes.
 fn main() -> Result<()> {
     let device = Device::new_rocm(0)?;
-    let (experts, topk, hidden, inter) = (288usize, 10usize, 2560usize, 640usize);
+    // `INTER=320` gives the per-rank shapes of a two-way tensor-parallel split.
+    let inter: usize = std::env::var("INTER").ok().and_then(|v| v.parse().ok()).unwrap_or(640);
+    let (experts, topk, hidden) = (288usize, 10usize, 2560usize);
     for (name, n, k, dtype) in [
         ("gate/up", inter, hidden, GgmlDType::Q4K),
         ("down", hidden, inter, GgmlDType::Q8_0),
