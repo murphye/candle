@@ -305,6 +305,7 @@ pub struct HipStream {
     /// launches and every hand-out of the raw stream to foreign code.
     epoch: std::sync::atomic::AtomicU64,
     derived: std::sync::Mutex<Option<Derived>>,
+    derived_ids: std::sync::atomic::AtomicU64,
     capturing: std::sync::atomic::AtomicBool,
     has_graph_pool: std::sync::atomic::AtomicBool,
     graph_pool: std::sync::Mutex<GraphPool>,
@@ -325,6 +326,9 @@ struct Derived {
     ptr: u64,
     bytes: usize,
     cached: bool,
+    /// Distinguishes this derived buffer from a later one with the same key (device
+    /// addresses are reused), for renewals that must name the buffer they vouch for.
+    id: u64,
 }
 
 // SAFETY: HIP streams may be used from any thread once created.
@@ -348,6 +352,7 @@ impl HipStream {
             cache: std::sync::Mutex::new(BlockCache::default()),
             epoch: std::sync::atomic::AtomicU64::new(0),
             derived: std::sync::Mutex::new(None),
+            derived_ids: std::sync::atomic::AtomicU64::new(1),
             capturing: std::sync::atomic::AtomicBool::new(false),
             has_graph_pool: std::sync::atomic::AtomicBool::new(false),
             graph_pool: std::sync::Mutex::new(GraphPool::default()),
@@ -382,21 +387,39 @@ impl HipStream {
     }
 
     /// Remembers `data` as derived from `key`, valid until the next write to the stream.
-    /// Call it after enqueuing the work that reads `data`.
-    pub fn set_derived(&self, key: (u64, usize, usize), data: HipSlice<u8>) {
+    /// Call it after enqueuing the work that reads `data`. Returns the buffer's identity for
+    /// [`Self::renew_derived_id`].
+    pub fn set_derived(&self, key: (u64, usize, usize), data: HipSlice<u8>) -> u64 {
         let data = std::mem::ManuallyDrop::new(data);
         // SAFETY: the stream handle is read out once and dropped; `data` is never used again.
         drop(unsafe { std::ptr::read(&data.stream) });
+        let id = self
+            .derived_ids
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let new = Derived {
             epoch: self.epoch(),
             key,
             ptr: data.ptr,
             bytes: data.len,
             cached: data.cached,
+            id,
         };
         let old = self.derived.lock().unwrap().replace(new);
         if let Some(old) = old {
             self.free_derived(old);
+        }
+        id
+    }
+
+    /// [`Self::renew_derived`] for the buffer `set_derived` returned `id` for, if it is still
+    /// the current one: a later buffer under the same key (a reused address) is left alone.
+    pub fn renew_derived_id(&self, id: u64) -> bool {
+        match self.derived.lock().unwrap().as_mut() {
+            Some(d) if d.id == id => {
+                d.epoch = self.epoch();
+                true
+            }
+            _ => false,
         }
     }
 

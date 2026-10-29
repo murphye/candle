@@ -826,29 +826,43 @@ impl QRocmStorage {
         };
         let ids_ptr = ids.as_rocm_slice::<u32>()?.slice(i1..i2).device_ptr();
 
-        // Quantize the activation rows to q8_1, zero padded to MATRIX_ROW_PADDING.
+        // Quantize the activation rows to q8_1, zero padded to MATRIX_ROW_PADDING. One input
+        // row per token may already be quantized as the stream's shared activation (seeded by
+        // its producer, or by a matmul over the same rows just before).
         let total_rows = batch * input_dim1;
         let k_padded = pad(k, MATRIX_ROW_PADDING);
         let row_bytes = k_padded / GgmlDType::Q8_1.block_size() * GgmlDType::Q8_1.type_size();
-        let x_q8_1 = unsafe { dev.alloc::<u8>(total_rows * row_bytes)? };
-        let func = dev.get_or_load_func(
-            &format!("mmvq_gguf_quantize_q8_1_{dst_tag}"),
-            &kernels::MMVQ,
-        )?;
-        let cfg = LaunchConfig {
-            grid_dim: (
-                ceil_div(k_padded, CUDA_QUANTIZE_BLOCK_SIZE) as u32,
-                total_rows as u32,
-                1,
-            ),
-            block_dim: (CUDA_QUANTIZE_BLOCK_SIZE as u32, 1, 1),
-            shared_mem_bytes: 0,
+        let shared = (input_dim1 == 1)
+            .then(|| SharedQ8Activation::new(dev, x_ptr, dst_tag, k, batch))
+            .transpose()?;
+        let mut own_q8_1: Option<HipSlice<u8>> = None;
+        let x_q8_1: u64 = match &shared {
+            Some(shared) => shared.ptr,
+            None => {
+                let y = unsafe { dev.alloc::<u8>(total_rows * row_bytes)? };
+                let func = dev.get_or_load_func(
+                    &format!("mmvq_gguf_quantize_q8_1_{dst_tag}"),
+                    &kernels::MMVQ,
+                )?;
+                let cfg = LaunchConfig {
+                    grid_dim: (
+                        ceil_div(k_padded, CUDA_QUANTIZE_BLOCK_SIZE) as u32,
+                        total_rows as u32,
+                        1,
+                    ),
+                    block_dim: (CUDA_QUANTIZE_BLOCK_SIZE as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut builder = func.builder();
+                builder.arg(&x_ptr);
+                builder.arg(&y);
+                barg!(builder, k as i32, k_padded as i32);
+                unsafe { builder.launch(cfg) }.w()?;
+                let ptr = y.device_ptr();
+                own_q8_1 = Some(y);
+                ptr
+            }
         };
-        let mut builder = func.builder();
-        builder.arg(&x_ptr);
-        builder.arg(&x_q8_1);
-        barg!(builder, k as i32, k_padded as i32);
-        unsafe { builder.launch(cfg) }.w()?;
 
         // Every output element is written, so the buffer needs no zeroing.
         let out_slots = if reduce.is_some() { 1 } else { topk };
@@ -910,6 +924,10 @@ impl QRocmStorage {
             builder.arg(&n_experts);
         }
         unsafe { builder.launch(cfg) }.w()?;
+        drop(own_q8_1);
+        if let Some(shared) = shared {
+            shared.keep();
+        }
         Ok((
             RocmStorage {
                 slice: out,
@@ -1295,9 +1313,22 @@ impl SharedQ8Activation {
     /// Only the matmul's own output was written since the quantization: keep it for the next.
     fn keep(self) {
         match self.fresh {
-            Some(y) => self.stream.set_derived(self.key, y),
+            Some(y) => {
+                self.stream.set_derived(self.key, y);
+            }
             None => self.stream.renew_derived(),
         }
+    }
+}
+
+/// Declares that nothing launched or allocated since the shared activation quantization
+/// `seed` (from [`qgemv_gate_mean_seeded`]) was recorded has touched that activation, so the
+/// next quantized matmul over it may still reuse it. A later quantization that replaced the
+/// seed is left alone.
+pub fn renew_shared_activation(device: &crate::Device, seed: u64) -> bool {
+    match device {
+        crate::Device::Rocm(device) => device.hip_stream().renew_derived_id(seed),
+        _ => false,
     }
 }
 
@@ -2007,19 +2038,20 @@ pub fn qgemv_gate_mean(
     xn: &crate::Tensor,
     groups: usize,
 ) -> Result<Option<crate::Tensor>> {
-    qgemv_gate_mean_impl(lo, w, xn, groups, false)
+    Ok(qgemv_gate_mean_impl(lo, w, xn, groups, false)?.map(|(out, _)| out))
 }
 
 /// [`qgemv_gate_mean`] whose kernel also quantizes its output to q8_1 and leaves that as the
 /// stream's shared activation quantization: the next quantized matmul over the result (with
 /// nothing launched or allocated in between) skips its own quantize launch. Shapes without a
 /// specialized kernel take the plain path.
+/// Also returns the seed's identity for [`renew_shared_activation`] when one was left.
 pub fn qgemv_gate_mean_seeded(
     lo: &crate::Tensor,
     w: &super::QTensor,
     xn: &crate::Tensor,
     groups: usize,
-) -> Result<Option<crate::Tensor>> {
+) -> Result<Option<(crate::Tensor, Option<u64>)>> {
     qgemv_gate_mean_impl(lo, w, xn, groups, true)
 }
 
@@ -2029,7 +2061,7 @@ fn qgemv_gate_mean_impl(
     xn: &crate::Tensor,
     groups: usize,
     seed_q8: bool,
-) -> Result<Option<crate::Tensor>> {
+) -> Result<Option<(crate::Tensor, Option<u64>)>> {
     let crate::Device::Rocm(device) = lo.device() else {
         return Ok(None);
     };
@@ -2095,19 +2127,22 @@ fn qgemv_gate_mean_impl(
     };
     // SAFETY: ffi; shapes, formats and alignment were checked above.
     unsafe { builder.launch(cfg) }.w()?;
-    if let Some(q8) = q8 {
+    let seed = q8.map(|q8| {
         // The key SharedQ8Activation::new computes for bf16 activations of this shape.
         device
             .hip_stream()
-            .set_derived((out.device_ptr(), hidden, rows * 4), q8);
-    }
+            .set_derived((out.device_ptr(), hidden, rows * 4), q8)
+    });
     let mut dims = xn.dims().to_vec();
     *dims.last_mut().expect("xn has a feature axis") = hidden;
-    Ok(Some(crate::Tensor::from_storage(
-        crate::Storage::Rocm(RocmStorage::wrap_rocm_slice(out, device.clone())),
-        dims,
-        crate::op::BackpropOp::none(),
-        false,
+    Ok(Some((
+        crate::Tensor::from_storage(
+            crate::Storage::Rocm(RocmStorage::wrap_rocm_slice(out, device.clone())),
+            dims,
+            crate::op::BackpropOp::none(),
+            false,
+        ),
+        seed,
     )))
 }
 
