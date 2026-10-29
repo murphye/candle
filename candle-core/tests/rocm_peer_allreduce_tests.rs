@@ -51,3 +51,45 @@ fn peer_allreduce_sums_across_gpus() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn peer_allgather_stacks_ranks() -> Result<()> {
+    let devices = [Device::new_rocm(0), Device::new_rocm(1)];
+    let [Ok(d0), Ok(d1)] = devices else {
+        return Ok(());
+    };
+    let setups = [&d0, &d1]
+        .iter()
+        .enumerate()
+        .map(|(rank, d)| {
+            PeerAllReduceSetup::new(d.as_rocm_device().unwrap(), rank, 2, 1 << 20).map(|(s, _)| s)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let ranks: Vec<PeerAllReduce> = PeerAllReduceSetup::connect_in_process(setups)?;
+    let host = |t: &Tensor| t.to_dtype(DType::F32)?.to_device(&Device::Cpu);
+    for n in [16usize, 3 * 124160] {
+        let inputs = [&d0, &d1]
+            .iter()
+            .enumerate()
+            .map(|(rank, d)| {
+                Tensor::arange(0u32, n as u32, d)?
+                    .to_dtype(DType::F32)?
+                    .affine(0.001, rank as f64 * 10.0)?
+                    .to_dtype(DType::BF16)?
+                    .reshape((1, n))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let outs = ranks
+            .iter()
+            .zip(&inputs)
+            .map(|(r, x)| r.all_gather(x))
+            .collect::<Result<Vec<_>>>()?;
+        let want = Tensor::cat(&[host(&inputs[0])?, host(&inputs[1])?], 0)?;
+        for out in &outs {
+            assert_eq!(out.dims(), [2, 1, n]);
+            let err = (host(out)?.reshape((2, n))? - &want)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            assert_eq!(err, 0.0, "n={n}: gathered rows differ");
+        }
+    }
+    Ok(())
+}

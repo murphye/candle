@@ -179,8 +179,18 @@ impl PeerAllReduce {
 
     /// The sum of `xs` over every rank; every rank must call this with the same shape.
     pub fn all_reduce(&self, xs: &Tensor) -> Result<Tensor> {
+        self.exchange(xs, "peer_allreduce_bf16", 1)
+    }
+
+    /// Every rank's `xs` stacked rank-major: `[world, ..xs.dims()]`.
+    pub fn all_gather(&self, xs: &Tensor) -> Result<Tensor> {
+        self.exchange(xs, "peer_allgather_bf16", self.world)
+    }
+
+    /// Runs `kernel` over `xs`; its output holds `out_mult` copies of `xs`' shape.
+    fn exchange(&self, xs: &Tensor, kernel: &str, out_mult: usize) -> Result<Tensor> {
         if !self.supports(xs) {
-            crate::bail!("peer all-reduce does not take {:?} {:?}", xs.dtype(), xs.shape());
+            crate::bail!("peer collective does not take {:?} {:?}", xs.dtype(), xs.shape());
         }
         let xs = xs.contiguous()?;
         let n = xs.elem_count();
@@ -195,10 +205,8 @@ impl PeerAllReduce {
         if x % 16 != 0 {
             crate::bail!("peer all-reduce needs 16-byte aligned input");
         }
-        let out = unsafe { self.device.alloc::<half::bf16>(n)? };
-        let func = self
-            .device
-            .get_or_load_func("peer_allreduce_bf16", &kernels::PEER_ALLREDUCE)?;
+        let out = unsafe { self.device.alloc::<half::bf16>(n * out_mult)? };
+        let func = self.device.get_or_load_func(kernel, &kernels::PEER_ALLREDUCE)?;
         let y = out.device_ptr();
         let (n, max_elems, rank, world) = (
             n as i32,
@@ -224,9 +232,13 @@ impl PeerAllReduce {
         unsafe { builder.launch(cfg) }.w()?;
         drop(guard);
         let storage = Storage::Rocm(super::RocmStorage::wrap_rocm_slice(out, self.device.clone()));
+        let mut dims = xs.dims().to_vec();
+        if out_mult > 1 {
+            dims.insert(0, out_mult);
+        }
         Ok(Tensor::from_storage(
             storage,
-            xs.shape().clone(),
+            dims,
             crate::op::BackpropOp::none(),
             false,
         ))

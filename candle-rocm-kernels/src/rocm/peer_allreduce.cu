@@ -15,12 +15,18 @@
 
 typedef unsigned int v4u __attribute__((ext_vector_type(4)));
 
-// `peers`: `world` receive-buffer data pointers, then `world` flag pointers, as seen from this
-// rank. `n` is a multiple of 8.
-extern "C" __global__ void __launch_bounds__(1024)
-    peer_allreduce_bf16(const __nv_bfloat16 *__restrict__ x, __nv_bfloat16 *__restrict__ y,
-                        const int n, const int max_elems, const uint64_t *__restrict__ peers,
-                        const int rank, const int world, int *__restrict__ epoch) {
+// Spinning on a peer's flag gives up after this many 100 MHz ticks (10 s) and traps, so a
+// stalled rank surfaces as a launch failure instead of a hung graph.
+#define PEER_SPIN_TIMEOUT_TICKS 1000000000ull
+
+// Pushes this rank's `n` elements of `x` into slot `rank` of the current half of every peer's
+// receive buffer, publishes the epoch and waits for every peer's epoch. On return the current
+// half of this rank's own receive buffer holds every peer's `x`. Must be called by the whole
+// (single) workgroup.
+static __device__ __forceinline__ int peer_exchange(const __nv_bfloat16 *__restrict__ x, const int n,
+                                                     const int max_elems, const uint64_t *__restrict__ peers,
+                                                     const int rank, const int world,
+                                                     int *__restrict__ epoch) {
   __shared__ int ep;
   const int t = threadIdx.x;
   if (t == 0) {
@@ -51,14 +57,32 @@ extern "C" __global__ void __launch_bounds__(1024)
       }
     }
     int *own = reinterpret_cast<int *>(peers[world + rank]);
+    const uint64_t start = wall_clock64();
     for (int peer = 0; peer < world; ++peer) {
       if (peer != rank) {
         while (__hip_atomic_load(own + peer, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < ep) {
+          if (wall_clock64() - start > PEER_SPIN_TIMEOUT_TICKS) {
+            __builtin_trap();
+          }
         }
       }
     }
   }
   __syncthreads();
+  return ep;
+}
+
+// `peers`: `world` receive-buffer data pointers, then `world` flag pointers, as seen from this
+// rank. `n` is a multiple of 8. y = sum over ranks of x.
+extern "C" __global__ void __launch_bounds__(1024)
+    peer_allreduce_bf16(const __nv_bfloat16 *__restrict__ x, __nv_bfloat16 *__restrict__ y,
+                        const int n, const int max_elems, const uint64_t *__restrict__ peers,
+                        const int rank, const int world, int *__restrict__ epoch) {
+  const int ep = peer_exchange(x, n, max_elems, peers, rank, world, epoch);
+  const int half = ep & 1;
+  const int t = threadIdx.x;
+  const int nv = n / 8;
+  const v4u *xv = reinterpret_cast<const v4u *>(x);
   const __nv_bfloat16 *recv = reinterpret_cast<const __nv_bfloat16 *>(peers[rank]);
   v4u *yv = reinterpret_cast<v4u *>(y);
   for (int i = t; i < nv; i += blockDim.x) {
@@ -87,6 +111,30 @@ extern "C" __global__ void __launch_bounds__(1024)
       ov[j] = __float2bfloat16(acc[j]);
     }
     yv[i] = o;
+  }
+  if (t == 0) {
+    *epoch = ep;
+  }
+}
+
+// y[r * n .. (r + 1) * n) = rank r's x, for every rank: the ranks' inputs concatenated.
+extern "C" __global__ void __launch_bounds__(1024)
+    peer_allgather_bf16(const __nv_bfloat16 *__restrict__ x, __nv_bfloat16 *__restrict__ y,
+                        const int n, const int max_elems, const uint64_t *__restrict__ peers,
+                        const int rank, const int world, int *__restrict__ epoch) {
+  const int ep = peer_exchange(x, n, max_elems, peers, rank, world, epoch);
+  const int half = ep & 1;
+  const int t = threadIdx.x;
+  const int nv = n / 8;
+  const __nv_bfloat16 *recv = reinterpret_cast<const __nv_bfloat16 *>(peers[rank]);
+  for (int peer = 0; peer < world; ++peer) {
+    const v4u *src = peer == rank
+                         ? reinterpret_cast<const v4u *>(x)
+                         : reinterpret_cast<const v4u *>(recv + (size_t)(half * world + peer) * max_elems);
+    v4u *dst = reinterpret_cast<v4u *>(y + (size_t)peer * n);
+    for (int i = t; i < nv; i += blockDim.x) {
+      dst[i] = src[i];
+    }
   }
   if (t == 0) {
     *epoch = ep;
