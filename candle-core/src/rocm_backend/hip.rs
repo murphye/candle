@@ -256,7 +256,23 @@ impl Staging {
 /// holds enough free memory (the grouped MoE path reuses ~1 GB per layer).
 const CACHE_MAX_BLOCK_BYTES: usize = 1536 << 20;
 /// Upper bound on the bytes held by the cache of one stream.
-const CACHE_MAX_TOTAL_BYTES: usize = 2 << 30;
+/// Default bound on the freed blocks a stream keeps for reuse. Prefill temporaries of many
+/// distinct sizes fill the cache quickly, and whatever it holds is memory the device's pool
+/// cannot hand to a live allocation: engines sizing a KV cache against free memory must
+/// account for it. `CANDLE_ROCM_BLOCK_CACHE_MB` overrides it.
+const CACHE_MAX_TOTAL_BYTES_DEFAULT: usize = 512 << 20;
+
+/// The block cache bound in bytes (see `CACHE_MAX_TOTAL_BYTES_DEFAULT`).
+pub fn block_cache_max_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("CANDLE_ROCM_BLOCK_CACHE_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|mb| mb << 20)
+            .unwrap_or(CACHE_MAX_TOTAL_BYTES_DEFAULT)
+    })
+}
 
 /// The bytes actually allocated for a request: 512 byte granularity for small
 /// blocks, then four size classes per power of two (at most 25% slack).
@@ -684,7 +700,7 @@ impl HipStream {
                 cache.pending.push((ptr, block, events));
                 return;
             }
-            if cache.total_bytes + block <= CACHE_MAX_TOTAL_BYTES {
+            if cache.total_bytes + block <= block_cache_max_bytes() {
                 cache.total_bytes += block;
                 cache.free.entry(block).or_default().push(ptr);
                 return;
