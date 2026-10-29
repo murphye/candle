@@ -83,6 +83,15 @@ template <> __device__ __forceinline__ __nv_bfloat16 moe_from_float<__nv_bfloat1
 }
 
 // y[pair, n] = x[row(pair), :] . w[expert(pair), n, :] for every routed pair.
+// A workgroup barrier that publishes LDS writes only. `__syncthreads()` also waits for every
+// outstanding global load, which would make the K loop's prefetch of the next step wait at
+// each barrier; this leaves those loads in flight.
+static __device__ __forceinline__ void moe_lds_barrier() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+
 // `x_per_pair` selects x's row: the pair itself ([pairs, k], down projections) or its
 // token (pair / topk, [tokens, k], gate and up). `qk` weights per quant block,
 // `parts` = qk / 8.
@@ -225,7 +234,7 @@ static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict_
     load_step(0, a_cur, b_cur);
     for (int k0 = 0; k0 < k; k0 += MOE_BK) {
         store_step(k0, a_cur, b_cur);
-        __syncthreads();
+        moe_lds_barrier();
         // The next step's loads are issued after the LDS write, so the wait for this step's
         // registers above does not also wait for them; they land during the MMAs below.
         const bool more = k0 + MOE_BK < k;
@@ -256,7 +265,7 @@ static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict_
                 }
             }
         }
-        __syncthreads();
+        moe_lds_barrier();
         if (more) {
 #pragma unroll
             for (int i = 0; i < A_GROUPS; ++i) {
