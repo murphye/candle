@@ -636,7 +636,7 @@ impl QRocmStorage {
         ids: &RocmStorage,
         ids_l: &crate::Layout,
     ) -> Result<(RocmStorage, crate::Shape)> {
-        self.indexed_moe(None, self_shape, input, input_l, ids, ids_l)
+        self.indexed_moe(None, None, self_shape, input, input_l, ids, ids_l)
     }
 
     /// `act(x @ self[ids]^T) * (x @ up[ids]^T)` in one kernel, for GLU experts whose
@@ -655,7 +655,7 @@ impl QRocmStorage {
         if up.dtype() != self.dtype() || up.data.len != self.data.len {
             crate::bail!("indexed_moe_glu_forward: gate and up weights differ");
         }
-        self.indexed_moe(Some((up, act)), self_shape, input, input_l, ids, ids_l)
+        self.indexed_moe(Some((up, act)), None, self_shape, input, input_l, ids, ids_l)
     }
 
     /// Grouped GEMM over the experts for prefill-sized batches: `x: [tokens, 1 | topk, k]`,
@@ -781,6 +781,7 @@ impl QRocmStorage {
     fn indexed_moe(
         &self,
         glu: Option<(&QRocmStorage, i32)>,
+        extra: Option<(&QRocmStorage, Option<&QRocmStorage>, usize)>,
         self_shape: &crate::Shape,
         input: &RocmStorage,
         input_l: &crate::Layout,
@@ -856,9 +857,11 @@ impl QRocmStorage {
             S::F32(s) => s.device_ptr(),
             _ => unreachable!(),
         };
-        let name = match glu {
-            Some(_) => format!("indexed_moe_glu_{tag}_{dst_tag}"),
-            None => format!("indexed_moe_{tag}_{dst_tag}"),
+        let name = match (glu, extra) {
+            (Some(_), Some(_)) => format!("indexed_moe_glu_x_{tag}_{dst_tag}"),
+            (Some(_), None) => format!("indexed_moe_glu_{tag}_{dst_tag}"),
+            (None, Some(_)) => format!("indexed_moe_x_{tag}_{dst_tag}"),
+            (None, None) => format!("indexed_moe_{tag}_{dst_tag}"),
         };
         let func = dev.get_or_load_func(&name, &kernels::QUANTIZED)?;
         // One output row per warp.
@@ -886,6 +889,14 @@ impl QRocmStorage {
         );
         if glu.is_some() {
             builder.arg(&act);
+        }
+        let n_experts = extra.map_or(0, |(_, _, n)| n as i32);
+        if let Some((extra_w, extra_up, _)) = extra {
+            builder.arg(&extra_w.data.inner);
+            if let Some(extra_up) = extra_up {
+                builder.arg(&extra_up.data.inner);
+            }
+            builder.arg(&n_experts);
         }
         unsafe { builder.launch(cfg) }.w()?;
         Ok((
@@ -1860,4 +1871,115 @@ pub fn qgemv_gate_mean(
         crate::op::BackpropOp::none(),
         false,
     )))
+}
+
+
+/// Rocm storage of a quantized tensor, or an error.
+fn rocm_qstorage(t: &super::QTensor) -> Result<&QRocmStorage> {
+    match &t.storage {
+        super::QStorage::Rocm(s) => Ok(s),
+        _ => crate::bail!("indexed MoE with an extra expert needs rocm quantized tensors"),
+    }
+}
+
+fn rocm_tensor_storage<'a, G: std::ops::Deref<Target = crate::Storage>>(
+    guard: &'a G,
+    name: &str,
+) -> Result<&'a RocmStorage> {
+    match &**guard {
+        crate::Storage::Rocm(s) => Ok(s),
+        _ => crate::bail!("indexed MoE with an extra expert: {name} must be a rocm tensor"),
+    }
+}
+
+/// `x @ experts[ids]^T` where ids at or past `experts.dim(0)` select rows of `extra`
+/// (`[extra_count, n, k]` or `[n, k]`, same format as `experts`): the shared expert of an MoE
+/// block runs in the same launch as the routed ones.
+pub fn indexed_moe_forward_with_extra(
+    experts: &super::QTensor,
+    extra: &super::QTensor,
+    x: &crate::Tensor,
+    ids: &crate::Tensor,
+) -> Result<crate::Tensor> {
+    let (n_experts, out_shape) = extra_table_shapes(experts, extra, None)?;
+    let (w, e) = (rocm_qstorage(experts)?, rocm_qstorage(extra)?);
+    let (xs, is) = (x.storage(), ids.storage());
+    let (storage, shape) = w.indexed_moe(
+        None,
+        Some((e, None, n_experts)),
+        &out_shape,
+        rocm_tensor_storage(&xs, "x")?,
+        x.layout(),
+        rocm_tensor_storage(&is, "ids")?,
+        ids.layout(),
+    )?;
+    Ok(crate::Tensor::from_storage(
+        crate::Storage::Rocm(storage),
+        shape,
+        crate::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+/// GLU form of [`indexed_moe_forward_with_extra`]: `act(x @ gate[ids]^T) * (x @ up[ids]^T)` with
+/// `extra_gate` / `extra_up` for ids at or past the expert count. `act`: 0 silu, 1 gelu.
+pub fn indexed_moe_glu_forward_with_extra(
+    gate: &super::QTensor,
+    up: &super::QTensor,
+    act: i32,
+    extra_gate: &super::QTensor,
+    extra_up: &super::QTensor,
+    x: &crate::Tensor,
+    ids: &crate::Tensor,
+) -> Result<crate::Tensor> {
+    let (n_experts, out_shape) = extra_table_shapes(gate, extra_gate, Some((up, extra_up)))?;
+    let (g, u) = (rocm_qstorage(gate)?, rocm_qstorage(up)?);
+    let (eg, eu) = (rocm_qstorage(extra_gate)?, rocm_qstorage(extra_up)?);
+    let (xs, is) = (x.storage(), ids.storage());
+    let (storage, shape) = g.indexed_moe(
+        Some((u, act)),
+        Some((eg, Some(eu), n_experts)),
+        &out_shape,
+        rocm_tensor_storage(&xs, "x")?,
+        x.layout(),
+        rocm_tensor_storage(&is, "ids")?,
+        ids.layout(),
+    )?;
+    Ok(crate::Tensor::from_storage(
+        crate::Storage::Rocm(storage),
+        shape,
+        crate::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+/// Checks that `extra` (and `up`s) match `experts`' format and `[n, k]`, returning the routed
+/// expert count and `experts`' shape.
+fn extra_table_shapes(
+    experts: &super::QTensor,
+    extra: &super::QTensor,
+    ups: Option<(&super::QTensor, &super::QTensor)>,
+) -> Result<(usize, crate::Shape)> {
+    let (n_experts, n, k) = experts.shape().dims3()?;
+    let extra_nk = match extra.shape().dims() {
+        [_, en, ek] | [en, ek] => (*en, *ek),
+        dims => crate::bail!("extra expert table has shape {dims:?}"),
+    };
+    let mut ok = extra_nk == (n, k) && extra.dtype() == experts.dtype();
+    if let Some((up, extra_up)) = ups {
+        ok &= up.shape() == experts.shape()
+            && up.dtype() == experts.dtype()
+            && extra_up.shape() == extra.shape()
+            && extra_up.dtype() == experts.dtype();
+    }
+    if !ok {
+        crate::bail!(
+            "extra expert {:?} {:?} does not match experts {:?} {:?}",
+            extra.dtype(),
+            extra.shape(),
+            experts.dtype(),
+            experts.shape()
+        );
+    }
+    Ok((n_experts, experts.shape().clone()))
 }

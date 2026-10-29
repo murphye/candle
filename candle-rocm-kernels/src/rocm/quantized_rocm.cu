@@ -39,7 +39,9 @@ __device__ void indexed_moe_dst(
     const int n,
     const int k,
     const int k_padded,
-    const int input_dim1) {
+    const int input_dim1,
+    const void * __restrict__ extra_weights,
+    const int n_experts) {
     const int task_id = blockIdx.y * gridDim.z + blockIdx.z;
     const int input_idx = (input_dim1 == 1) ? blockIdx.y : task_id;
     const unsigned int expert_id = indices[task_id];
@@ -50,7 +52,10 @@ __device__ void indexed_moe_dst(
 
     const size_t weight_expert_stride_bytes = (size_t)n * k / qk * sizeof(block_q_t);
     const size_t input_task_stride_bytes = (size_t)k_padded / QK8_1 * sizeof(block_q8_1);
-    const block_q_t * w = (const block_q_t *)((const char *)all_weights + expert_id * weight_expert_stride_bytes);
+    // Ids at or past `n_experts` pick experts of the extra table (a shared expert).
+    const block_q_t * w = expert_id < (unsigned)n_experts
+        ? (const block_q_t *)((const char *)all_weights + expert_id * weight_expert_stride_bytes)
+        : (const block_q_t *)((const char *)extra_weights + (expert_id - n_experts) * weight_expert_stride_bytes);
     const block_q8_1 * x = (const block_q8_1 *)((const char *)all_inputs + input_idx * input_task_stride_bytes);
 
     const int blocks_per_row_x = k / qk;
@@ -81,7 +86,10 @@ __device__ void indexed_moe_glu(
     const int k,
     const int k_padded,
     const int input_dim1,
-    const int act) {
+    const int act,
+    const void * __restrict__ extra_gate,
+    const void * __restrict__ extra_up,
+    const int n_experts) {
     const int task_id = blockIdx.y * gridDim.z + blockIdx.z;
     const int input_idx = (input_dim1 == 1) ? blockIdx.y : task_id;
     const unsigned int expert_id = indices[task_id];
@@ -92,8 +100,10 @@ __device__ void indexed_moe_glu(
 
     const size_t weight_expert_stride_bytes = (size_t)n * k / qk * sizeof(block_q_t);
     const size_t input_task_stride_bytes = (size_t)k_padded / QK8_1 * sizeof(block_q8_1);
-    const block_q_t * wg = (const block_q_t *)((const char *)gate_weights + expert_id * weight_expert_stride_bytes);
-    const block_q_t * wu = (const block_q_t *)((const char *)up_weights + expert_id * weight_expert_stride_bytes);
+    const bool routed = expert_id < (unsigned)n_experts;
+    const size_t off = (routed ? expert_id : expert_id - n_experts) * weight_expert_stride_bytes;
+    const block_q_t * wg = (const block_q_t *)((const char *)(routed ? gate_weights : extra_gate) + off);
+    const block_q_t * wu = (const block_q_t *)((const char *)(routed ? up_weights : extra_up) + off);
     const block_q8_1 * x = (const block_q8_1 *)((const char *)all_inputs + input_idx * input_task_stride_bytes);
 
     const int blocks_per_row_x = k / qk;
@@ -128,7 +138,21 @@ extern "C" __global__ void indexed_moe_##QNAME##_##DST( \
     const int k_padded, \
     const int input_dim1) { \
     indexed_moe_dst<QK, QI, BLOCK, VDR, VEC_DOT, DST_T> \
-        (all_weights, all_inputs, indices, all_outputs, n, k, k_padded, input_dim1); \
+        (all_weights, all_inputs, indices, all_outputs, n, k, k_padded, input_dim1, nullptr, 0x7fffffff); \
+} \
+extern "C" __global__ void indexed_moe_x_##QNAME##_##DST( \
+    const void * __restrict__ all_weights, \
+    const void * __restrict__ all_inputs, \
+    const unsigned int * __restrict__ indices, \
+    DST_T * __restrict__ all_outputs, \
+    const int n, \
+    const int k, \
+    const int k_padded, \
+    const int input_dim1, \
+    const void * __restrict__ extra_weights, \
+    const int n_experts) { \
+    indexed_moe_dst<QK, QI, BLOCK, VDR, VEC_DOT, DST_T> \
+        (all_weights, all_inputs, indices, all_outputs, n, k, k_padded, input_dim1, extra_weights, n_experts); \
 }
 
 #define INDEXED_MOE_GLU(QNAME, QK, QI, BLOCK, VDR, VEC_DOT, DST, DST_T) \
@@ -144,7 +168,24 @@ extern "C" __global__ void indexed_moe_glu_##QNAME##_##DST( \
     const int input_dim1, \
     const int act) { \
     indexed_moe_glu<QK, QI, BLOCK, VDR, VEC_DOT, DST_T> \
-        (gate_weights, up_weights, all_inputs, indices, all_outputs, n, k, k_padded, input_dim1, act); \
+        (gate_weights, up_weights, all_inputs, indices, all_outputs, n, k, k_padded, input_dim1, act, nullptr, nullptr, 0x7fffffff); \
+} \
+extern "C" __global__ void indexed_moe_glu_x_##QNAME##_##DST( \
+    const void * __restrict__ gate_weights, \
+    const void * __restrict__ up_weights, \
+    const void * __restrict__ all_inputs, \
+    const unsigned int * __restrict__ indices, \
+    DST_T * __restrict__ all_outputs, \
+    const int n, \
+    const int k, \
+    const int k_padded, \
+    const int input_dim1, \
+    const int act, \
+    const void * __restrict__ extra_gate, \
+    const void * __restrict__ extra_up, \
+    const int n_experts) { \
+    indexed_moe_glu<QK, QI, BLOCK, VDR, VEC_DOT, DST_T> \
+        (gate_weights, up_weights, all_inputs, indices, all_outputs, n, k, k_padded, input_dim1, act, extra_gate, extra_up, n_experts); \
 }
 
 #define INDEXED_MOE_ALL_DST(QNAME, QK, QI, BLOCK, VDR, VEC_DOT) \
