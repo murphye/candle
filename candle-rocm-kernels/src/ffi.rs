@@ -14,6 +14,7 @@ pub type hipDeviceptr_t = *mut c_void;
 pub const hipSuccess: hipError_t = 0;
 pub const hipErrorOutOfMemory: hipError_t = 2;
 pub const hipErrorDeinitialized: hipError_t = 4;
+pub const hipErrorStreamCaptureUnsupported: hipError_t = 900;
 
 pub type hipMemcpyKind = c_int;
 pub const hipMemcpyHostToDevice: hipMemcpyKind = 1;
@@ -30,6 +31,11 @@ pub const hipDeviceAttributeIntegrated: hipDeviceAttribute_t = 16;
 pub type hipMemPool_t = *mut c_void;
 pub type hipMemPoolAttr = c_int;
 pub const hipMemPoolAttrReleaseThreshold: hipMemPoolAttr = 0x4;
+
+pub type hipGraph_t = *mut c_void;
+pub type hipGraphExec_t = *mut c_void;
+pub type hipStreamCaptureMode = c_int;
+pub const hipStreamCaptureModeRelaxed: hipStreamCaptureMode = 2;
 
 pub type hipStreamCaptureStatus = c_int;
 pub const hipStreamCaptureStatusNone: hipStreamCaptureStatus = 0;
@@ -62,6 +68,23 @@ extern "C" {
     pub fn hipStreamIsCapturing(
         stream: hipStream_t,
         status: *mut hipStreamCaptureStatus,
+    ) -> hipError_t;
+    pub fn hipStreamBeginCapture(stream: hipStream_t, mode: hipStreamCaptureMode) -> hipError_t;
+    pub fn hipStreamEndCapture(stream: hipStream_t, graph: *mut hipGraph_t) -> hipError_t;
+    pub fn hipGraphInstantiateWithFlags(
+        exec: *mut hipGraphExec_t,
+        graph: hipGraph_t,
+        flags: u64,
+    ) -> hipError_t;
+    pub fn hipGraphLaunch(exec: hipGraphExec_t, stream: hipStream_t) -> hipError_t;
+    pub fn hipGraphExecDestroy(exec: hipGraphExec_t) -> hipError_t;
+    pub fn hipGraphDestroy(graph: hipGraph_t) -> hipError_t;
+    pub fn hipMalloc(ptr: *mut *mut c_void, size: usize) -> hipError_t;
+    pub fn hipMemcpy(
+        dst: *mut c_void,
+        src: *const c_void,
+        size: usize,
+        kind: hipMemcpyKind,
     ) -> hipError_t;
 
     pub fn hipEventCreateWithFlags(event: *mut hipEvent_t, flags: c_uint) -> hipError_t;

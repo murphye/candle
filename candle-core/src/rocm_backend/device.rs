@@ -130,6 +130,21 @@ impl RocmDevice {
         self.stream.clone()
     }
 
+    /// Starts capturing this device's work into a graph; see [`HipStream::begin_capture`].
+    pub fn begin_capture(&self) -> Result<()> {
+        self.stream.begin_capture().w()
+    }
+
+    /// Ends the capture started by [`Self::begin_capture`] and instantiates the graph.
+    pub fn end_capture(&self) -> Result<super::hip::HipGraph> {
+        self.stream.end_capture().w()
+    }
+
+    /// Replays a graph captured on this device.
+    pub fn launch_graph(&self, graph: &super::hip::HipGraph) -> Result<()> {
+        graph.launch(&self.stream).w()
+    }
+
     pub fn id(&self) -> DeviceId {
         self.id
     }

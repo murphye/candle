@@ -280,6 +280,20 @@ struct BlockCache {
     pending: Vec<(u64, usize, Vec<sys::hipEvent_t>)>,
 }
 
+/// Device buffers allocated while a stream is captured into a graph. They are never
+/// handed to eager work: a replay rewrites them, so they only return to this pool, which
+/// every graph of the stream shares (replays are ordered on the stream, and a graph's
+/// intermediates are dead once it finishes).
+#[derive(Debug, Default)]
+struct GraphPool {
+    free: std::collections::HashMap<usize, Vec<u64>>,
+    owned: std::collections::HashSet<u64>,
+    /// Blocks written from the host during a capture. Graphs read them on every replay,
+    /// so they never return to the free lists.
+    frozen: std::collections::HashSet<u64>,
+    bytes: usize,
+}
+
 /// A stream on a given device. All candle work for a device is ordered on one.
 #[derive(Debug)]
 pub struct HipStream {
@@ -291,6 +305,14 @@ pub struct HipStream {
     /// launches and every hand-out of the raw stream to foreign code.
     epoch: std::sync::atomic::AtomicU64,
     derived: std::sync::Mutex<Option<Derived>>,
+    capturing: std::sync::atomic::AtomicBool,
+    has_graph_pool: std::sync::atomic::AtomicBool,
+    graph_pool: std::sync::Mutex<GraphPool>,
+    /// Eager buffers released during a capture, freed once it ends: a free issued
+    /// mid-capture would be recorded into the graph instead.
+    deferred_frees: std::sync::Mutex<Vec<u64>>,
+    /// Carries host uploads made during a capture; created on first use.
+    upload_stream: std::sync::OnceLock<usize>,
 }
 
 /// A buffer computed from another buffer (e.g. activations quantized for a
@@ -326,6 +348,11 @@ impl HipStream {
             cache: std::sync::Mutex::new(BlockCache::default()),
             epoch: std::sync::atomic::AtomicU64::new(0),
             derived: std::sync::Mutex::new(None),
+            capturing: std::sync::atomic::AtomicBool::new(false),
+            has_graph_pool: std::sync::atomic::AtomicBool::new(false),
+            graph_pool: std::sync::Mutex::new(GraphPool::default()),
+            deferred_frees: std::sync::Mutex::new(Vec::new()),
+            upload_stream: std::sync::OnceLock::new(),
         }))
     }
 
@@ -376,6 +403,8 @@ impl HipStream {
     fn free_derived(&self, d: Derived) {
         if d.cached {
             self.release(d.ptr, cached_block_bytes(d.bytes));
+        } else if self.is_capturing_graph() {
+            self.deferred_frees.lock().unwrap().push(d.ptr);
         } else if self.bind().is_ok() {
             unsafe { sys::hipFreeAsync(d.ptr as *mut c_void, self.raw) };
         }
@@ -398,6 +427,7 @@ impl HipStream {
     }
 
     pub fn synchronize(&self) -> Result<(), HipError> {
+        self.reject_while_capturing()?;
         self.bind()?;
         check(unsafe { sys::hipStreamSynchronize(self.raw) })
     }
@@ -418,6 +448,15 @@ impl HipStream {
         let bytes = len * std::mem::size_of::<T>();
         let mut ptr = 0;
         let mut cached = false;
+        if bytes > 0 && self.is_capturing_graph() {
+            return Ok(HipSlice {
+                ptr: self.graph_alloc(cached_block_bytes(bytes))?,
+                len,
+                cached: true,
+                stream: self.clone(),
+                marker: PhantomData,
+            });
+        }
         if bytes > 0 {
             if bytes <= CACHE_MAX_BLOCK_BYTES {
                 let block = cached_block_bytes(bytes);
@@ -437,6 +476,115 @@ impl HipStream {
             stream: self.clone(),
             marker: PhantomData,
         })
+    }
+
+    fn is_capturing_graph(&self) -> bool {
+        self.capturing.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A block from the graph pool, allocated outside the stream's order: a stream-ordered
+    /// allocation would become a node of the graph being captured.
+    fn graph_alloc(&self, block: usize) -> Result<u64, HipError> {
+        let mut pool = self.graph_pool.lock().unwrap();
+        if let Some(ptr) = pool.free.get_mut(&block).and_then(Vec::pop) {
+            return Ok(ptr);
+        }
+        self.bind()?;
+        let mut ptr = std::ptr::null_mut();
+        check(unsafe { sys::hipMalloc(&mut ptr, block) })?;
+        let ptr = ptr as u64;
+        pool.owned.insert(ptr);
+        pool.bytes += block;
+        self.has_graph_pool
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(ptr)
+    }
+
+    /// A new graph-pool block for data uploaded during a capture: never reused.
+    fn graph_alloc_frozen(&self, block: usize) -> Result<u64, HipError> {
+        self.bind()?;
+        let mut ptr = std::ptr::null_mut();
+        check(unsafe { sys::hipMalloc(&mut ptr, block) })?;
+        let ptr = ptr as u64;
+        let mut pool = self.graph_pool.lock().unwrap();
+        pool.owned.insert(ptr);
+        pool.frozen.insert(ptr);
+        pool.bytes += block;
+        self.has_graph_pool
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(ptr)
+    }
+
+    /// Returns `ptr` to the graph pool if it came from there.
+    fn release_to_graph_pool(&self, ptr: u64, block: usize) -> bool {
+        if !self.has_graph_pool.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        let mut pool = self.graph_pool.lock().unwrap();
+        if !pool.owned.contains(&ptr) {
+            return false;
+        }
+        if !pool.frozen.contains(&ptr) {
+            pool.free.entry(block).or_default().push(ptr);
+        }
+        true
+    }
+
+    /// Bytes held by the graph pool.
+    pub fn graph_pool_bytes(&self) -> usize {
+        self.graph_pool.lock().unwrap().bytes
+    }
+
+    /// Starts capturing the work enqueued on this stream into a graph. Until
+    /// [`Self::end_capture`], allocations come from the graph pool and host copies fail.
+    pub fn begin_capture(&self) -> Result<(), HipError> {
+        self.bind()?;
+        check(unsafe { sys::hipStreamBeginCapture(self.raw, sys::hipStreamCaptureModeRelaxed) })?;
+        self.capturing
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Ends the capture started by [`Self::begin_capture`] and instantiates it.
+    pub fn end_capture(&self) -> Result<HipGraph, HipError> {
+        self.capturing
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.bind()?;
+        let mut graph = std::ptr::null_mut();
+        let ended = check(unsafe { sys::hipStreamEndCapture(self.raw, &mut graph) });
+        for ptr in std::mem::take(&mut *self.deferred_frees.lock().unwrap()) {
+            unsafe { sys::hipFreeAsync(ptr as *mut c_void, self.raw) };
+        }
+        ended?;
+        let mut exec = std::ptr::null_mut();
+        let instantiated = check(unsafe { sys::hipGraphInstantiateWithFlags(&mut exec, graph, 0) });
+        if let Err(e) = instantiated {
+            unsafe { sys::hipGraphDestroy(graph) };
+            return Err(e);
+        }
+        Ok(HipGraph {
+            graph,
+            exec,
+            ordinal: self.ordinal,
+        })
+    }
+
+    /// A second stream on this device for uploads that must not join a capture.
+    fn upload_stream(&self) -> Result<sys::hipStream_t, HipError> {
+        if let Some(&raw) = self.upload_stream.get() {
+            return Ok(raw as sys::hipStream_t);
+        }
+        let mut raw = std::ptr::null_mut();
+        check(unsafe { sys::hipStreamCreateWithFlags(&mut raw, sys::hipStreamNonBlocking) })?;
+        let raw = *self.upload_stream.get_or_init(|| raw as usize);
+        Ok(raw as sys::hipStream_t)
+    }
+
+    fn reject_while_capturing(&self) -> Result<(), HipError> {
+        if self.is_capturing_graph() {
+            return Err(HipError(sys::hipErrorStreamCaptureUnsupported));
+        }
+        Ok(())
     }
 
     fn take_cached(&self, block: usize) -> u64 {
@@ -482,6 +630,10 @@ impl HipStream {
 
     /// Releases an uncached block: stream-ordered free, after any guarding events.
     fn release_uncached(&self, ptr: u64) {
+        if self.is_capturing_graph() {
+            self.deferred_frees.lock().unwrap().push(ptr);
+            return;
+        }
         let events = self.cache.lock().unwrap().guards.remove(&ptr);
         if self.bind().is_ok() {
             for e in events.into_iter().flatten() {
@@ -496,6 +648,9 @@ impl HipStream {
 
     /// Returns a block to the cache, or frees it when the cache is full.
     fn release(&self, ptr: u64, block: usize) {
+        if self.release_to_graph_pool(ptr, block) {
+            return;
+        }
         {
             let mut cache = self.cache.lock().unwrap();
             if let Some(events) = cache.guards.remove(&ptr) {
@@ -507,6 +662,10 @@ impl HipStream {
                 cache.free.entry(block).or_default().push(ptr);
                 return;
             }
+        }
+        if self.is_capturing_graph() {
+            self.deferred_frees.lock().unwrap().push(ptr);
+            return;
         }
         if self.bind().is_ok() {
             unsafe { sys::hipFreeAsync(ptr as *mut c_void, self.raw) };
@@ -597,6 +756,20 @@ impl HipStream {
     }
 
     pub fn clone_htod<T: DeviceRepr>(self: &Arc<Self>, src: &[T]) -> Result<HipSlice<T>, HipError> {
+        if self.is_capturing_graph() && !src.is_empty() {
+            // A block captured kernels may also use would be overwritten on replay by
+            // whatever ran there first; the upload gets a block of its own.
+            let block = cached_block_bytes(std::mem::size_of_val(src));
+            let mut dst = HipSlice {
+                ptr: self.graph_alloc_frozen(block)?,
+                len: src.len(),
+                cached: true,
+                stream: self.clone(),
+                marker: PhantomData,
+            };
+            self.memcpy_htod(src, &mut dst)?;
+            return Ok(dst);
+        }
         let mut dst = unsafe { self.alloc::<T>(src.len())? };
         self.memcpy_htod(src, &mut dst)?;
         Ok(dst)
@@ -614,6 +787,28 @@ impl HipStream {
         assert!(dst.len() >= src.len(), "memcpy_htod: destination too small");
         let bytes = std::mem::size_of_val(src);
         if bytes == 0 {
+            return Ok(());
+        }
+        if self.is_capturing_graph() {
+            // Host data uploaded during a capture is constant for the graph (shapes and
+            // strides): copy it now rather than recording a copy that would replay whatever
+            // the host buffer holds later. Only blocks reserved by `clone_htod` qualify:
+            // captured kernels never touch them, so the copy can't be overwritten on replay.
+            if !self.graph_pool.lock().unwrap().frozen.contains(&dst.device_ptr()) {
+                return Err(HipError(sys::hipErrorStreamCaptureUnsupported));
+            }
+            self.bind()?;
+            let upload = self.upload_stream()?;
+            check(unsafe {
+                sys::hipMemcpyAsync(
+                    dst.device_ptr() as *mut c_void,
+                    src.as_ptr() as *const c_void,
+                    bytes,
+                    sys::hipMemcpyHostToDevice,
+                    upload,
+                )
+            })?;
+            check(unsafe { sys::hipStreamSynchronize(upload) })?;
             return Ok(());
         }
         self.bind()?;
@@ -660,6 +855,7 @@ impl HipStream {
         let mut dst = Vec::<T>::with_capacity(len);
         let bytes = len * std::mem::size_of::<T>();
         if bytes > 0 {
+            self.reject_while_capturing()?;
             self.bind()?;
             // Copy straight into the spare capacity, then expose it once written.
             check(unsafe {
@@ -688,6 +884,7 @@ impl HipStream {
         if bytes == 0 {
             return Ok(());
         }
+        self.reject_while_capturing()?;
         self.bind()?;
         check(unsafe {
             sys::hipMemcpyAsync(
@@ -1201,6 +1398,38 @@ impl Drop for RocBlas {
     fn drop(&mut self) {
         if self.stream.bind().is_ok() {
             unsafe { sys::rocblas_destroy_handle(self.handle) };
+        }
+    }
+}
+
+/// An instantiated graph captured from a [`HipStream`].
+#[derive(Debug)]
+pub struct HipGraph {
+    graph: sys::hipGraph_t,
+    exec: sys::hipGraphExec_t,
+    ordinal: usize,
+}
+
+// SAFETY: graph handles may be used from any thread.
+unsafe impl Send for HipGraph {}
+unsafe impl Sync for HipGraph {}
+
+impl HipGraph {
+    /// Replays the graph on `stream`, which must belong to the device it was captured on.
+    pub fn launch(&self, stream: &HipStream) -> Result<(), HipError> {
+        stream.touch();
+        stream.bind()?;
+        check(unsafe { sys::hipGraphLaunch(self.exec, stream.raw) })
+    }
+}
+
+impl Drop for HipGraph {
+    fn drop(&mut self) {
+        if bind_device(self.ordinal).is_ok() {
+            unsafe {
+                sys::hipGraphExecDestroy(self.exec);
+                sys::hipGraphDestroy(self.graph);
+            }
         }
     }
 }
