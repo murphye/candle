@@ -45,6 +45,14 @@ fn multi_segment_matches_single_matmuls() -> Result<()> {
             assert_eq!(out.dims(), want.dims());
             let err = max_rel_err(out, &want)?;
             assert!(err < 1e-2, "{:?} rows={rows}: rel err {err}", w.dtype());
+            // Against the dequantized weights in f32: the kernels quantize the activations to
+            // q8_1 themselves, so only quantization noise separates them from the reference.
+            let reference = x
+                .to_dtype(DType::F32)?
+                .to_device(&Device::Cpu)?
+                .broadcast_matmul(&w.dequantize(&Device::Cpu)?.t()?)?;
+            let err = max_rel_err(out, &reference)?;
+            assert!(err < 3e-2, "{:?} rows={rows}: rel err vs f32 reference {err}", w.dtype());
         }
     }
     Ok(())
