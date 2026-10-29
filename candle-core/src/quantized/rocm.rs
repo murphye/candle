@@ -1356,16 +1356,20 @@ impl QRocmStorage {
         // Decode batches also give each row its own warp, reading it once for every column.
         if b_size > 1 && k <= 8 * nrows {
             const ROWS_PER_BLOCK: usize = 4;
+            // Q4_K waves take two rows once there are enough rows to fill the GPU anyway:
+            // the rows share each activation load, which is what bounds multi-column dots.
+            let x2 = tag == "q4_k" && nrows % 2 == 0 && nrows >= 2048;
+            let rows_per_wave = if x2 { 2 } else { 1 };
             let cfg = LaunchConfig {
-                grid_dim: (nrows.div_ceil(ROWS_PER_BLOCK) as u32, 1, 1),
+                grid_dim: (nrows.div_ceil(ROWS_PER_BLOCK * rows_per_wave) as u32, 1, 1),
                 block_dim: (WARP_SIZE as u32, ROWS_PER_BLOCK as u32, 1),
                 shared_mem_bytes: 0,
             };
             let func = dev.get_or_load_func_keyed(
-                (tag, dst_tag, "warp_row"),
+                (tag, dst_tag, if x2 { "warp_row_x2" } else { "warp_row" }),
                 b_size,
                 &kernels::MMVQ,
-                || format!("mmvq_gguf_{tag}_{dst_tag}_warp_row{b_size}"),
+                || format!("mmvq_gguf_{tag}_{dst_tag}_warp_row{b_size}{}", if x2 { "x2" } else { "" }),
             )?;
             let stride_col_y = (k_padded / GgmlDType::Q8_1.block_size()) as i32;
             let mut builder = func.builder();
