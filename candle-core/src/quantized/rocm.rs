@@ -1680,3 +1680,180 @@ mod test {
         Ok(())
     }
 }
+
+/// Format code of a weight `qgemv_fused.cu` dequantizes on the fly.
+fn fused_weight_code(dtype: GgmlDType) -> Option<i32> {
+    match dtype {
+        GgmlDType::Q4_0 => Some(0),
+        GgmlDType::Q5_0 => Some(1),
+        GgmlDType::Q8_0 => Some(2),
+        GgmlDType::Q4K => Some(3),
+        GgmlDType::Q6K => Some(4),
+        _ => None,
+    }
+}
+
+const FUSED_MAX_ROWS: usize = 8;
+
+/// `[rows, k]` of a contiguous bf16 activation matrix on `device`, and its device address, when
+/// the fused kernels take it.
+fn fused_activation(x: &crate::Tensor, device: &RocmDevice) -> Result<Option<(usize, usize, u64)>> {
+    if x.dtype() != crate::DType::BF16 || !x.is_contiguous() {
+        return Ok(None);
+    }
+    let k = x.dim(crate::D::Minus1)?;
+    let rows = x.elem_count() / k.max(1);
+    if rows == 0 || rows > FUSED_MAX_ROWS {
+        return Ok(None);
+    }
+    let (storage, layout) = x.storage_and_layout();
+    let crate::Storage::Rocm(storage) = &*storage else {
+        return Ok(None);
+    };
+    if storage.device.id() != device.id() {
+        return Ok(None);
+    }
+    let ptr = storage
+        .as_rocm_slice::<half::bf16>()?
+        .slice(layout.start_offset()..)
+        .device_ptr();
+    Ok((ptr % 16 == 0).then_some((rows, k, ptr)))
+}
+
+/// `(act(x . w1^T), x . w2^T)` for bf16 `x: [.., k]` with at most 8 rows, in one launch: two
+/// GGUF matrices `[r1, k]` and `[r2, k]` over the same activations, where `act` is
+/// `silu(v * scale)` when `silu_scale1` is set. `None` when the shapes or formats don't fit.
+pub fn qgemv_pair(
+    x: &crate::Tensor,
+    w1: &super::QTensor,
+    silu_scale1: Option<f32>,
+    w2: &super::QTensor,
+) -> Result<Option<(crate::Tensor, crate::Tensor)>> {
+    let crate::Device::Rocm(device) = x.device() else {
+        return Ok(None);
+    };
+    let (Some(t1), Some(t2)) = (fused_weight_code(w1.dtype()), fused_weight_code(w2.dtype())) else {
+        return Ok(None);
+    };
+    let Some((rows, k, x_ptr)) = fused_activation(x, device)? else {
+        return Ok(None);
+    };
+    let (Ok((r1, k1)), Ok((r2, k2))) = (w1.shape().dims2(), w2.shape().dims2()) else {
+        return Ok(None);
+    };
+    if k1 != k
+        || k2 != k
+        || k % w1.dtype().block_size() != 0
+        || k % w2.dtype().block_size() != 0
+        || k % 8 != 0
+    {
+        return Ok(None);
+    }
+    let y1 = unsafe { device.alloc::<half::bf16>(rows * r1)? };
+    let y2 = unsafe { device.alloc::<half::bf16>(rows * r2)? };
+    let pair_rows = 1;
+    let func = device.get_or_load_func("qgemv_pair_bf16_r1", &kernels::QGEMV_FUSED)?;
+    let (w1_ptr, w2_ptr) = (w1.device_ptr()? as u64, w2.device_ptr()? as u64);
+    let (m, k_i, r1_i, r2_i) = (rows as i32, k as i32, r1 as i32, r2 as i32);
+    let act1 = silu_scale1.is_some() as i32;
+    let scale1 = silu_scale1.unwrap_or(1.0);
+    let mut builder = func.builder();
+    builder.arg(&x_ptr);
+    builder.arg(&m);
+    builder.arg(&k_i);
+    builder.arg(&w1_ptr);
+    builder.arg(&t1);
+    builder.arg(&r1_i);
+    builder.arg(&act1);
+    builder.arg(&scale1);
+    builder.arg(&y1);
+    builder.arg(&w2_ptr);
+    builder.arg(&t2);
+    builder.arg(&r2_i);
+    builder.arg(&y2);
+    let cfg = LaunchConfig {
+        grid_dim: ((r1 + r2).div_ceil(pair_rows) as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    // SAFETY: ffi; shapes, formats and alignment were checked above.
+    unsafe { builder.launch(cfg) }.w()?;
+    let mut lead = x.dims().to_vec();
+    lead.pop();
+    let wrap = |slice, n: usize| {
+        let mut dims = lead.clone();
+        dims.push(n);
+        crate::Tensor::from_storage(
+            crate::Storage::Rocm(RocmStorage::wrap_rocm_slice(slice, device.clone())),
+            dims,
+            crate::op::BackpropOp::none(),
+            false,
+        )
+    };
+    Ok(Some((wrap(y1, r1), wrap(y2, r2))))
+}
+
+/// `mean_s xn[.., s * hidden + h] * sigmoid(lo . w[s * hidden + h])` over `groups` streams,
+/// for up to 4 streams:
+/// the gate projection of bf16 `lo: [.., k]` through GGUF `w: [groups * hidden, k]` and the gated
+/// mean of `xn: [.., groups * hidden]`, in one launch. `None` when the shapes or formats don't fit.
+pub fn qgemv_gate_mean(
+    lo: &crate::Tensor,
+    w: &super::QTensor,
+    xn: &crate::Tensor,
+    groups: usize,
+) -> Result<Option<crate::Tensor>> {
+    let crate::Device::Rocm(device) = lo.device() else {
+        return Ok(None);
+    };
+    let Some(t) = fused_weight_code(w.dtype()) else {
+        return Ok(None);
+    };
+    let (Some((rows, k, lo_ptr)), Some((xn_rows, width, xn_ptr))) =
+        (fused_activation(lo, device)?, fused_activation(xn, device)?)
+    else {
+        return Ok(None);
+    };
+    let Ok((w_rows, w_k)) = w.shape().dims2() else {
+        return Ok(None);
+    };
+    let block = w.dtype().block_size();
+    if w_k != k || k % block != 0 || k % 8 != 0 || xn_rows != rows || w_rows != width
+        || width % groups != 0
+        || groups > 4
+        || 32 % groups != 0
+    {
+        return Ok(None);
+    }
+    let hidden = width / groups;
+    let out = unsafe { device.alloc::<half::bf16>(rows * hidden)? };
+    let func = device.get_or_load_func("qgemv_gate_mean_bf16", &kernels::QGEMV_FUSED)?;
+    let w_ptr = w.device_ptr()? as u64;
+    let (m, k_i, g, h) = (rows as i32, k as i32, groups as i32, hidden as i32);
+    let mut builder = func.builder();
+    builder.arg(&lo_ptr);
+    builder.arg(&m);
+    builder.arg(&k_i);
+    builder.arg(&w_ptr);
+    builder.arg(&t);
+    builder.arg(&xn_ptr);
+    builder.arg(&g);
+    builder.arg(&h);
+    builder.arg(&out);
+    const WARPS: usize = 8;
+    let cfg = LaunchConfig {
+        grid_dim: (hidden.div_ceil(WARPS) as u32, 1, 1),
+        block_dim: ((WARPS * 32) as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    // SAFETY: ffi; shapes, formats and alignment were checked above.
+    unsafe { builder.launch(cfg) }.w()?;
+    let mut dims = xn.dims().to_vec();
+    *dims.last_mut().expect("xn has a feature axis") = hidden;
+    Ok(Some(crate::Tensor::from_storage(
+        crate::Storage::Rocm(RocmStorage::wrap_rocm_slice(out, device.clone())),
+        dims,
+        crate::op::BackpropOp::none(),
+        false,
+    )))
+}

@@ -25,6 +25,7 @@ const MODULES: &[(&str, &str)] = &[
     ("MMVQ", "rocm/mmvq_rocm.cu"),
     ("MOE_GEMM", "rocm/moe_gemm.cu"),
     ("PEER_ALLREDUCE", "rocm/peer_allreduce.cu"),
+    ("QGEMV_FUSED", "rocm/qgemv_fused.cu"),
     ("QUANTIZED", "rocm/quantized_rocm.cu"),
     ("REDUCE", "candle-kernels/reduce.cu"),
     ("SORT", "candle-kernels/sort.cu"),
