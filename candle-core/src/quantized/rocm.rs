@@ -2007,6 +2007,29 @@ pub fn qgemv_gate_mean(
     xn: &crate::Tensor,
     groups: usize,
 ) -> Result<Option<crate::Tensor>> {
+    qgemv_gate_mean_impl(lo, w, xn, groups, false)
+}
+
+/// [`qgemv_gate_mean`] whose kernel also quantizes its output to q8_1 and leaves that as the
+/// stream's shared activation quantization: the next quantized matmul over the result (with
+/// nothing launched or allocated in between) skips its own quantize launch. Shapes without a
+/// specialized kernel take the plain path.
+pub fn qgemv_gate_mean_seeded(
+    lo: &crate::Tensor,
+    w: &super::QTensor,
+    xn: &crate::Tensor,
+    groups: usize,
+) -> Result<Option<crate::Tensor>> {
+    qgemv_gate_mean_impl(lo, w, xn, groups, true)
+}
+
+fn qgemv_gate_mean_impl(
+    lo: &crate::Tensor,
+    w: &super::QTensor,
+    xn: &crate::Tensor,
+    groups: usize,
+    seed_q8: bool,
+) -> Result<Option<crate::Tensor>> {
     let crate::Device::Rocm(device) = lo.device() else {
         return Ok(None);
     };
@@ -2031,11 +2054,24 @@ pub fn qgemv_gate_mean(
     }
     let hidden = width / groups;
     let out = unsafe { device.alloc::<half::bf16>(rows * hidden)? };
-    let name = match (k, groups, w.dtype()) {
-        (320, 4, GgmlDType::Q5_0) => "qgemv_gate_mean_bf16_k320_g4_q5_0",
-        _ => "qgemv_gate_mean_bf16",
+    let specialized = match (k, groups, w.dtype()) {
+        (320, 4, GgmlDType::Q5_0) => Some("qgemv_gate_mean_bf16_k320_g4_q5_0"),
+        _ => None,
     };
-    let func = device.get_or_load_func(name, &kernels::QGEMV_FUSED)?;
+    // The q8 variant needs the padded q8_1 row (MATRIX_ROW_PADDING) to equal the plain one.
+    let seed_q8 = seed_q8 && specialized.is_some() && hidden % MATRIX_ROW_PADDING == 0;
+    let q8 = if seed_q8 {
+        let row_bytes = hidden / GgmlDType::Q8_1.block_size() * GgmlDType::Q8_1.type_size();
+        Some(unsafe { device.alloc::<u8>(rows * row_bytes)? })
+    } else {
+        None
+    };
+    let name = match (specialized, seed_q8) {
+        (Some(name), true) => format!("{name}_q8"),
+        (Some(name), false) => name.to_string(),
+        (None, _) => "qgemv_gate_mean_bf16".to_string(),
+    };
+    let func = device.get_or_load_func(&name, &kernels::QGEMV_FUSED)?;
     let w_ptr = w.device_ptr()? as u64;
     let (m, k_i, g, h) = (rows as i32, k as i32, groups as i32, hidden as i32);
     let mut builder = func.builder();
@@ -2048,14 +2084,23 @@ pub fn qgemv_gate_mean(
     builder.arg(&g);
     builder.arg(&h);
     builder.arg(&out);
-    const WARPS: usize = 8;
+    if let Some(q8) = &q8 {
+        builder.arg(q8);
+    }
+    let warps = if seed_q8 { 32 } else { 8 };
     let cfg = LaunchConfig {
-        grid_dim: (hidden.div_ceil(WARPS) as u32, 1, 1),
-        block_dim: ((WARPS * 32) as u32, 1, 1),
+        grid_dim: (hidden.div_ceil(warps) as u32, 1, 1),
+        block_dim: ((warps * 32) as u32, 1, 1),
         shared_mem_bytes: 0,
     };
     // SAFETY: ffi; shapes, formats and alignment were checked above.
     unsafe { builder.launch(cfg) }.w()?;
+    if let Some(q8) = q8 {
+        // The key SharedQ8Activation::new computes for bf16 activations of this shape.
+        device
+            .hip_stream()
+            .set_derived((out.device_ptr(), hidden, rows * 4), q8);
+    }
     let mut dims = xn.dims().to_vec();
     *dims.last_mut().expect("xn has a feature axis") = hidden;
     Ok(Some(crate::Tensor::from_storage(

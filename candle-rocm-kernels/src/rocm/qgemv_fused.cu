@@ -329,19 +329,26 @@ __device__ __forceinline__ void qgemv_pair_fixed(const __nv_bfloat16 *__restrict
 QG_PAIR_FIXED(qgemv_pair_bf16_k10240_q4k_q4k, QG_Q4_K, QG_Q4_K, 5)
 QG_PAIR_FIXED(qgemv_pair_bf16_k10240_q6k_q4k, QG_Q6_K, QG_Q4_K, 5)
 
-// qgemv_gate_mean_bf16 for GROUPS streams over k = ITERS * (32 / GROUPS) * 8.
-template <int T, int GROUPS, int ITERS>
+// qgemv_gate_mean_bf16 for GROUPS streams over k = ITERS * (32 / GROUPS) * 8, WARPS columns
+// per workgroup. With Q8 the workgroup's 32 columns form one q8_1 block per batch row, written
+// to `q8` in the layout of mmvq_gguf_quantize_q8_1 (`nblocks = hidden / 32` blocks per row),
+// so the matmuls that consume the mixed activations skip their quantize launch.
+template <int T, int GROUPS, int ITERS, int WARPS, bool Q8>
 __device__ __forceinline__ void qgemv_gate_mean_fixed(const __nv_bfloat16 *__restrict__ lo, const int m,
                                                       const void *__restrict__ w,
                                                       const __nv_bfloat16 *__restrict__ xn, const int hidden,
-                                                      __nv_bfloat16 *__restrict__ out) {
+                                                      __nv_bfloat16 *__restrict__ out,
+                                                      block_q8_1 *__restrict__ q8) {
   constexpr int per = 32 / GROUPS;
   constexpr int k = ITERS * per * 8;
   constexpr int qk = T >= QG_Q4_K ? 256 : 32;
   const int lane = threadIdx.x % 32;
-  const int h = blockIdx.x * QG_GATE_WARPS + threadIdx.x / 32;
-  if (h >= hidden) {
-    return;
+  const int warp = threadIdx.x / 32;
+  const int h = blockIdx.x * WARPS + warp;
+  if constexpr (!Q8) {
+    if (h >= hidden) {
+      return;
+    }
   }
   const int s = lane / per;
   const int sub = lane % per;
@@ -395,6 +402,36 @@ __device__ __forceinline__ void qgemv_gate_mean_fixed(const __nv_bfloat16 *__res
       out[(int64_t)b * hidden + h] = __float2bfloat16(mix[b] / GROUPS);
     }
   }
+  if constexpr (Q8) {
+    // Quantize this workgroup's 32 columns (one block per batch row) from the stored bf16
+    // values, so the result equals a quantize launch over `out`.
+    static_assert(WARPS == 32, "the q8 variant quantizes one 32-column block per workgroup");
+    __shared__ float cols[QGEMV_MAX_ROWS][32];
+#pragma unroll
+    for (int b = 0; b < QGEMV_MAX_ROWS; ++b) {
+      if (b < m && lane == 0) {
+        cols[b][warp] = __bfloat162float(__float2bfloat16(mix[b] / GROUPS));
+      }
+    }
+    __syncthreads();
+    if (warp < m) {
+      const int b = warp;
+      const float xi = cols[b][lane];
+      float amax = fabsf(xi);
+      float sum = xi;
+      for (int off = 16; off > 0; off >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off, 32));
+        sum += __shfl_xor_sync(0xffffffff, sum, off, 32);
+      }
+      const float d = amax / 127.0f;
+      block_q8_1 *blk = q8 + (size_t)b * (hidden / 32) + blockIdx.x;
+      blk->qs[lane] = amax == 0.0f ? 0 : (int8_t)roundf(xi / d);
+      if (lane == 0) {
+        reinterpret_cast<half &>(blk->ds.x) = (half)d;
+        reinterpret_cast<half &>(blk->ds.y) = (half)sum;
+      }
+    }
+  }
 }
 
 // Same signature as qgemv_gate_mean_bf16; `k`, `t` and `groups` are fixed by the name.
@@ -403,6 +440,14 @@ __device__ __forceinline__ void qgemv_gate_mean_fixed(const __nv_bfloat16 *__res
       const __nv_bfloat16 *__restrict__ lo, const int m, const int k, const void *__restrict__ w,   \
       const int t, const __nv_bfloat16 *__restrict__ xn, const int groups, const int hidden,       \
       __nv_bfloat16 *__restrict__ out) {                                                           \
-    qgemv_gate_mean_fixed<T, GROUPS, ITERS>(lo, m, w, xn, hidden, out);                            \
+    qgemv_gate_mean_fixed<T, GROUPS, ITERS, QG_GATE_WARPS, false>(lo, m, w, xn, hidden, out,       \
+                                                                   nullptr);                       \
+  }                                                                                                \
+  extern "C" __global__ void __launch_bounds__(1024) NAME##_q8(                                    \
+      const __nv_bfloat16 *__restrict__ lo, const int m, const int k, const void *__restrict__ w,   \
+      const int t, const __nv_bfloat16 *__restrict__ xn, const int groups, const int hidden,       \
+      __nv_bfloat16 *__restrict__ out, void *__restrict__ q8) {                                    \
+    qgemv_gate_mean_fixed<T, GROUPS, ITERS, 32, true>(lo, m, w, xn, hidden, out,                   \
+                                                       (block_q8_1 *)q8);                          \
   }
 QG_GATE_MEAN_FIXED(qgemv_gate_mean_bf16_k320_g4_q5_0, QG_Q5_0, 4, 5)
