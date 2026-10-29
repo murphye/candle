@@ -32,6 +32,15 @@ pub type hipMemPool_t = *mut c_void;
 pub type hipMemPoolAttr = c_int;
 pub const hipMemPoolAttrReleaseThreshold: hipMemPoolAttr = 0x4;
 
+pub const hipDeviceMallocUncached: c_uint = 0x3;
+pub const hipIpcMemLazyEnablePeerAccess: c_uint = 0x1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct hipIpcMemHandle_t {
+    pub reserved: [u8; 64],
+}
+
 pub type hipGraph_t = *mut c_void;
 pub type hipGraphExec_t = *mut c_void;
 pub type hipStreamCaptureMode = c_int;
@@ -80,6 +89,15 @@ extern "C" {
     pub fn hipGraphExecDestroy(exec: hipGraphExec_t) -> hipError_t;
     pub fn hipGraphDestroy(graph: hipGraph_t) -> hipError_t;
     pub fn hipMalloc(ptr: *mut *mut c_void, size: usize) -> hipError_t;
+    pub fn hipFree(ptr: *mut c_void) -> hipError_t;
+    pub fn hipExtMallocWithFlags(ptr: *mut *mut c_void, size: usize, flags: c_uint) -> hipError_t;
+    pub fn hipIpcGetMemHandle(handle: *mut hipIpcMemHandle_t, ptr: *mut c_void) -> hipError_t;
+    pub fn hipIpcOpenMemHandle(
+        ptr: *mut *mut c_void,
+        handle: hipIpcMemHandle_t,
+        flags: c_uint,
+    ) -> hipError_t;
+    pub fn hipIpcCloseMemHandle(ptr: *mut c_void) -> hipError_t;
     pub fn hipMemcpy(
         dst: *mut c_void,
         src: *const c_void,

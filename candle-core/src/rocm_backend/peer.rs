@@ -1,0 +1,247 @@
+//! A one-shot all-reduce between tensor-parallel ranks over peer GPU memory (see
+//! `peer_allreduce.cu`). RCCL's small-message all-reduce costs tens of microseconds on PCIe;
+//! decode steps reduce a few tens of kilobytes about a hundred times, where this takes a few.
+//!
+//! Each rank allocates a receive buffer, shares its IPC handle with the other ranks (through
+//! whatever channel the caller has, such as an RCCL all-gather), and opens theirs.
+use std::ffi::c_void;
+
+use super::hip::{self, sys, HipSlice};
+use super::{kernels, LaunchConfig, RocmDevice, WrapErr};
+use crate::{DType, Result, Storage, Tensor};
+
+pub const MAX_RANKS: usize = 8;
+/// Bytes of one rank's shareable handle.
+pub const HANDLE_BYTES: usize = 64;
+/// The receive buffer starts with the flags, padded so the data stays aligned; small
+/// allocations may be carved out of shared blocks that IPC cannot export, so it is one.
+const FLAGS_BYTES: usize = 4096;
+
+/// This rank's receive buffer, before the peers' buffers are opened.
+pub struct PeerAllReduceSetup {
+    device: RocmDevice,
+    rank: usize,
+    world: usize,
+    max_elems: usize,
+    base: u64,
+}
+
+pub struct PeerAllReduce {
+    device: RocmDevice,
+    rank: usize,
+    world: usize,
+    max_elems: usize,
+    base: u64,
+    /// Peers' buffers mapped into this process; freed with `hipIpcCloseMemHandle`.
+    opened: Vec<u64>,
+    peers: HipSlice<u64>,
+    epoch: HipSlice<i32>,
+}
+
+impl std::fmt::Debug for PeerAllReduce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerAllReduce")
+            .field("rank", &self.rank)
+            .field("world", &self.world)
+            .field("max_elems", &self.max_elems)
+            .finish()
+    }
+}
+
+// SAFETY: the raw pointers are device addresses owned by this value.
+unsafe impl Send for PeerAllReduce {}
+unsafe impl Sync for PeerAllReduce {}
+
+fn uncached(bytes: usize) -> Result<u64> {
+    let mut ptr = std::ptr::null_mut();
+    hip::check(unsafe { sys::hipExtMallocWithFlags(&mut ptr, bytes, sys::hipDeviceMallocUncached) })
+        .w()?;
+    hip::check(unsafe { sys::hipMemsetAsync(ptr, 0, bytes, std::ptr::null_mut()) }).w()?;
+    hip::check(unsafe { sys::hipDeviceSynchronize() }).w()?;
+    Ok(ptr as u64)
+}
+
+fn ipc_handle(ptr: u64) -> Result<[u8; 64]> {
+    let mut handle = sys::hipIpcMemHandle_t { reserved: [0; 64] };
+    hip::check(unsafe { sys::hipIpcGetMemHandle(&mut handle, ptr as *mut c_void) }).w()?;
+    Ok(handle.reserved)
+}
+
+fn ipc_open(bytes: &[u8]) -> Result<u64> {
+    let mut handle = sys::hipIpcMemHandle_t { reserved: [0; 64] };
+    handle.reserved.copy_from_slice(bytes);
+    let mut ptr = std::ptr::null_mut();
+    hip::check(unsafe {
+        sys::hipIpcOpenMemHandle(&mut ptr, handle, sys::hipIpcMemLazyEnablePeerAccess)
+    })
+    .w()?;
+    Ok(ptr as u64)
+}
+
+impl PeerAllReduceSetup {
+    /// Allocates this rank's receive buffer for reductions of up to `max_elems` bf16
+    /// elements, and returns the handles the other ranks need to open it.
+    pub fn new(
+        device: &RocmDevice,
+        rank: usize,
+        world: usize,
+        max_elems: usize,
+    ) -> Result<(Self, [u8; HANDLE_BYTES])> {
+        if world < 2 || world > MAX_RANKS || rank >= world || max_elems % 8 != 0 {
+            crate::bail!("peer all-reduce: invalid rank {rank} of {world} for {max_elems} elements");
+        }
+        hip::bind_device(device.ordinal()).w()?;
+        let base = uncached(FLAGS_BYTES + 2 * world * max_elems * 2)?;
+        let handle = ipc_handle(base)?;
+        let setup = Self {
+            device: device.clone(),
+            rank,
+            world,
+            max_elems,
+            base,
+        };
+        Ok((setup, handle))
+    }
+
+    /// Connects ranks that all live in this process (one per GPU), through peer access instead
+    /// of IPC; `setups[r]` is rank `r`'s.
+    pub fn connect_in_process(setups: Vec<Self>) -> Result<Vec<PeerAllReduce>> {
+        let bases = setups.iter().map(|s| s.base).collect::<Vec<_>>();
+        for s in &setups {
+            hip::bind_device(s.device.ordinal()).w()?;
+            for other in &setups {
+                if other.device.ordinal() != s.device.ordinal() {
+                    let status =
+                        unsafe { sys::hipDeviceEnablePeerAccess(other.device.ordinal() as i32, 0) };
+                    // Already enabled is fine; the sticky error must not leak into later calls.
+                    unsafe { sys::hipGetLastError() };
+                    let _ = status;
+                }
+            }
+        }
+        setups
+            .into_iter()
+            .map(|s| s.finish(&bases, Vec::new()))
+            .collect()
+    }
+
+    fn finish(self, bases: &[u64], opened: Vec<u64>) -> Result<PeerAllReduce> {
+        hip::bind_device(self.device.ordinal()).w()?;
+        // The kernel takes every rank's data pointer, then every rank's flags pointer.
+        let table = bases
+            .iter()
+            .map(|b| b + FLAGS_BYTES as u64)
+            .chain(bases.iter().copied())
+            .collect::<Vec<_>>();
+        let peers = self.device.clone_htod(&table)?;
+        let epoch = self.device.alloc_zeros::<i32>(1)?;
+        Ok(PeerAllReduce {
+            device: self.device.clone(),
+            rank: self.rank,
+            world: self.world,
+            max_elems: self.max_elems,
+            base: self.base,
+            opened,
+            peers,
+            epoch,
+        })
+    }
+
+    /// Opens the other ranks' buffers; `handles[r]` is what rank `r`'s [`Self::new`] returned.
+    pub fn connect(self, handles: &[[u8; HANDLE_BYTES]]) -> Result<PeerAllReduce> {
+        if handles.len() != self.world {
+            crate::bail!("peer all-reduce: {} handles for {} ranks", handles.len(), self.world);
+        }
+        hip::bind_device(self.device.ordinal()).w()?;
+        let mut bases = vec![0u64; self.world];
+        let mut opened = Vec::new();
+        for (r, handle) in handles.iter().enumerate() {
+            bases[r] = if r == self.rank {
+                self.base
+            } else {
+                let base = ipc_open(handle)?;
+                opened.push(base);
+                base
+            };
+        }
+        self.finish(&bases, opened)
+    }
+}
+
+impl PeerAllReduce {
+    /// Whether `xs` is a reduction this path takes.
+    pub fn supports(&self, xs: &Tensor) -> bool {
+        xs.dtype() == DType::BF16
+            && xs.elem_count() <= self.max_elems
+            && xs.elem_count() % 8 == 0
+            && xs.device().same_device(&crate::Device::Rocm(self.device.clone()))
+    }
+
+    /// The sum of `xs` over every rank; every rank must call this with the same shape.
+    pub fn all_reduce(&self, xs: &Tensor) -> Result<Tensor> {
+        if !self.supports(xs) {
+            crate::bail!("peer all-reduce does not take {:?} {:?}", xs.dtype(), xs.shape());
+        }
+        let xs = xs.contiguous()?;
+        let n = xs.elem_count();
+        let (guard, layout) = xs.storage_and_layout();
+        let Storage::Rocm(storage) = &*guard else {
+            crate::bail!("peer all-reduce needs a rocm tensor");
+        };
+        let x = storage
+            .as_rocm_slice::<half::bf16>()?
+            .slice(layout.start_offset()..)
+            .device_ptr();
+        if x % 16 != 0 {
+            crate::bail!("peer all-reduce needs 16-byte aligned input");
+        }
+        let out = unsafe { self.device.alloc::<half::bf16>(n)? };
+        let func = self
+            .device
+            .get_or_load_func("peer_allreduce_bf16", &kernels::PEER_ALLREDUCE)?;
+        let y = out.device_ptr();
+        let (n, max_elems, rank, world) = (
+            n as i32,
+            self.max_elems as i32,
+            self.rank as i32,
+            self.world as i32,
+        );
+        let mut builder = func.builder();
+        builder.arg(&x);
+        builder.arg(&y);
+        builder.arg(&n);
+        builder.arg(&max_elems);
+        builder.arg(&self.peers);
+        builder.arg(&rank);
+        builder.arg(&world);
+        builder.arg(&self.epoch);
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (1024, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: ffi; the peers' buffers hold `max_elems` elements per slot and n <= max_elems.
+        unsafe { builder.launch(cfg) }.w()?;
+        drop(guard);
+        let storage = Storage::Rocm(super::RocmStorage::wrap_rocm_slice(out, self.device.clone()));
+        Ok(Tensor::from_storage(
+            storage,
+            xs.shape().clone(),
+            crate::op::BackpropOp::none(),
+            false,
+        ))
+    }
+}
+
+impl Drop for PeerAllReduce {
+    fn drop(&mut self) {
+        if hip::bind_device(self.device.ordinal()).is_ok() {
+            unsafe {
+                for &ptr in &self.opened {
+                    sys::hipIpcCloseMemHandle(ptr as *mut c_void);
+                }
+                sys::hipFree(self.base as *mut c_void);
+            }
+        }
+    }
+}

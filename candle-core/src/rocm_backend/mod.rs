@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 mod device;
 mod error;
 pub mod hip;
+pub mod peer;
 mod utils;
 pub use device::{DeviceId, RocmDevice, RocmFunc};
 pub use error::{RocmError, WrapErr};

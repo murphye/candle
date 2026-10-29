@@ -18,6 +18,7 @@ pub enum Id {
     Indexing,
     Mmvq,
     MoeGemm,
+    PeerAllreduce,
     Quantized,
     Random,
     Reduce,
@@ -26,7 +27,7 @@ pub enum Id {
     Unary,
 }
 
-pub const ALL_IDS: [Id; 15] = [
+pub const ALL_IDS: [Id; 16] = [
     Id::Affine,
     Id::Binary,
     Id::Cast,
@@ -36,6 +37,7 @@ pub const ALL_IDS: [Id; 15] = [
     Id::Indexing,
     Id::Mmvq,
     Id::MoeGemm,
+    Id::PeerAllreduce,
     Id::Quantized,
     Id::Random,
     Id::Reduce,
@@ -90,6 +92,7 @@ mdl!(GEMV, Gemv);
 mdl!(INDEXING, Indexing);
 mdl!(MMVQ, Mmvq);
 mdl!(MOE_GEMM, MoeGemm);
+mdl!(PEER_ALLREDUCE, PeerAllreduce);
 mdl!(QUANTIZED, Quantized);
 mdl!(RANDOM, Random);
 mdl!(REDUCE, Reduce);
