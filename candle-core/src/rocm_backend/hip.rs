@@ -427,6 +427,7 @@ impl HipStream {
     }
 
     pub fn synchronize(&self) -> Result<(), HipError> {
+        trace_transfer("sync", 0);
         self.reject_while_capturing()?;
         self.bind()?;
         check(unsafe { sys::hipStreamSynchronize(self.raw) })
@@ -538,6 +539,8 @@ impl HipStream {
     /// Starts capturing the work enqueued on this stream into a graph. Until
     /// [`Self::end_capture`], allocations come from the graph pool and host copies fail.
     pub fn begin_capture(&self) -> Result<(), HipError> {
+        // Derived buffers computed eagerly must not stand in for work the graph has to record.
+        self.touch();
         self.bind()?;
         check(unsafe { sys::hipStreamBeginCapture(self.raw, sys::hipStreamCaptureModeRelaxed) })?;
         self.capturing
@@ -549,6 +552,7 @@ impl HipStream {
     pub fn end_capture(&self) -> Result<HipGraph, HipError> {
         self.capturing
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.touch();
         self.bind()?;
         let mut graph = std::ptr::null_mut();
         let ended = check(unsafe { sys::hipStreamEndCapture(self.raw, &mut graph) });
@@ -582,7 +586,7 @@ impl HipStream {
 
     fn reject_while_capturing(&self) -> Result<(), HipError> {
         if self.is_capturing_graph() {
-            return Err(HipError(sys::hipErrorStreamCaptureUnsupported));
+            return Err(capture_unsupported());
         }
         Ok(())
     }
@@ -789,13 +793,14 @@ impl HipStream {
         if bytes == 0 {
             return Ok(());
         }
+        trace_transfer("htod", bytes);
         if self.is_capturing_graph() {
             // Host data uploaded during a capture is constant for the graph (shapes and
             // strides): copy it now rather than recording a copy that would replay whatever
             // the host buffer holds later. Only blocks reserved by `clone_htod` qualify:
             // captured kernels never touch them, so the copy can't be overwritten on replay.
             if !self.graph_pool.lock().unwrap().frozen.contains(&dst.device_ptr()) {
-                return Err(HipError(sys::hipErrorStreamCaptureUnsupported));
+                return Err(capture_unsupported());
             }
             self.bind()?;
             let upload = self.upload_stream()?;
@@ -855,6 +860,7 @@ impl HipStream {
         let mut dst = Vec::<T>::with_capacity(len);
         let bytes = len * std::mem::size_of::<T>();
         if bytes > 0 {
+            trace_transfer("dtoh", bytes);
             self.reject_while_capturing()?;
             self.bind()?;
             // Copy straight into the spare capacity, then expose it once written.
@@ -884,6 +890,7 @@ impl HipStream {
         if bytes == 0 {
             return Ok(());
         }
+        trace_transfer("dtoh", bytes);
         self.reject_while_capturing()?;
         self.bind()?;
         check(unsafe {
@@ -1400,6 +1407,36 @@ impl Drop for RocBlas {
             unsafe { sys::rocblas_destroy_handle(self.handle) };
         }
     }
+}
+
+/// With `CANDLE_ROCM_TRACE_TRANSFERS` set, prints the first mistral.rs frame of every
+/// host transfer, to audit what a forward pass exchanges with the host.
+pub fn trace_transfer(kind: &str, bytes: usize) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("CANDLE_ROCM_TRACE_TRANSFERS").is_some()) {
+        return;
+    }
+    let bt = std::backtrace::Backtrace::force_capture().to_string();
+    let site = bt
+        .lines()
+        .filter(|l| l.contains("mistralrs_core::") || l.contains("mistralrs_quant::"))
+        .take(2)
+        .map(|l| l.trim().split_once(": ").map_or(l.trim(), |(_, f)| f).to_string())
+        .collect::<Vec<_>>()
+        .join(" <- ");
+    eprintln!("TRANSFER {kind} {bytes} {site}");
+}
+
+/// The error for an operation a capture can't record. With `CANDLE_ROCM_CAPTURE_TRACE`
+/// set, the call site's backtrace is printed, to find what keeps a forward from capturing.
+fn capture_unsupported() -> HipError {
+    if std::env::var_os("CANDLE_ROCM_CAPTURE_TRACE").is_some() {
+        eprintln!(
+            "operation not permitted while capturing:\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+    }
+    HipError(sys::hipErrorStreamCaptureUnsupported)
 }
 
 /// An instantiated graph captured from a [`HipStream`].
