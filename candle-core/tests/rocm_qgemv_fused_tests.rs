@@ -34,8 +34,14 @@ fn quantized(rows: usize, k: usize, dtype: GgmlDType, salt: f32, dev: &Device) -
 #[test]
 fn fused_pair_matches_reference() -> Result<()> {
     let Ok(dev) = Device::new_rocm(0) else { return Ok(()) };
-    let k = 1024;
-    for (t1, t2) in [(GgmlDType::Q4K, GgmlDType::Q4K), (GgmlDType::Q6K, GgmlDType::Q4K), (GgmlDType::Q5_0, GgmlDType::Q8_0)] {
+    // k = 10240 with Q4_K/Q6_K and Q4_K takes the shape-specialized kernels.
+    for (k, t1, t2) in [
+        (1024, GgmlDType::Q4K, GgmlDType::Q4K),
+        (1024, GgmlDType::Q6K, GgmlDType::Q4K),
+        (1024, GgmlDType::Q5_0, GgmlDType::Q8_0),
+        (10240, GgmlDType::Q4K, GgmlDType::Q4K),
+        (10240, GgmlDType::Q6K, GgmlDType::Q4K),
+    ] {
         let (q1, w1) = quantized(40, k, t1, 0.1, &dev)?;
         let (q2, w2) = quantized(4, k, t2, 0.9, &dev)?;
         for rows in [1usize, 3, 8] {

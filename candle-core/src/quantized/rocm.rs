@@ -1767,7 +1767,14 @@ pub fn qgemv_pair(
     let y1 = unsafe { device.alloc::<half::bf16>(rows * r1)? };
     let y2 = unsafe { device.alloc::<half::bf16>(rows * r2)? };
     let pair_rows = 1;
-    let func = device.get_or_load_func("qgemv_pair_bf16_r1", &kernels::QGEMV_FUSED)?;
+    // Shapes with a specialized kernel (Qwen3.8-Flash-Next's hyper-connection mixers) issue
+    // every weight load up front; other shapes take the generic kernel.
+    let name = match (k, w1.dtype(), w2.dtype()) {
+        (10240, GgmlDType::Q4K, GgmlDType::Q4K) => "qgemv_pair_bf16_k10240_q4k_q4k",
+        (10240, GgmlDType::Q6K, GgmlDType::Q4K) => "qgemv_pair_bf16_k10240_q6k_q4k",
+        _ => "qgemv_pair_bf16_r1",
+    };
+    let func = device.get_or_load_func(name, &kernels::QGEMV_FUSED)?;
     let (w1_ptr, w2_ptr) = (w1.device_ptr()? as u64, w2.device_ptr()? as u64);
     let (m, k_i, r1_i, r2_i) = (rows as i32, k as i32, r1 as i32, r2 as i32);
     let act1 = silu_scale1.is_some() as i32;
@@ -1842,7 +1849,11 @@ pub fn qgemv_gate_mean(
     }
     let hidden = width / groups;
     let out = unsafe { device.alloc::<half::bf16>(rows * hidden)? };
-    let func = device.get_or_load_func("qgemv_gate_mean_bf16", &kernels::QGEMV_FUSED)?;
+    let name = match (k, groups, w.dtype()) {
+        (320, 4, GgmlDType::Q5_0) => "qgemv_gate_mean_bf16_k320_g4_q5_0",
+        _ => "qgemv_gate_mean_bf16",
+    };
+    let func = device.get_or_load_func(name, &kernels::QGEMV_FUSED)?;
     let w_ptr = w.device_ptr()? as u64;
     let (m, k_i, g, h) = (rows as i32, k as i32, groups as i32, hidden as i32);
     let mut builder = func.builder();

@@ -212,3 +212,197 @@ extern "C" __global__ void __launch_bounds__(QG_GATE_WARPS * 32)
     }
   }
 }
+
+// ---- Shape-specialized variants ----------------------------------------------------------
+// With the weight format and the chunk count per lane known at compile time, every chunk's
+// loads go out before the first dot product: the generic kernels above walk their chunks one
+// dependent round trip at a time, which at decode shapes costs more than the bytes do.
+
+template <int T>
+static __device__ __forceinline__ void qg_dequant8_t(const void *w, int64_t blocks_per_row, int64_t row,
+                                                     int c, float *out) {
+  constexpr int qk = T >= QG_Q4_K ? 256 : 32;
+  const int64_t ib = row * blocks_per_row + (int64_t)(c * 8) / qk;
+  const int part = (c * 8 % qk) / 8;
+  if constexpr (T == QG_Q4_0) {
+    moe_dequant8_q4_0(w, ib, part, out);
+  } else if constexpr (T == QG_Q5_0) {
+    moe_dequant8_q5_0(w, ib, part, out);
+  } else if constexpr (T == QG_Q8_0) {
+    moe_dequant8_q8_0(w, ib, part, out);
+  } else if constexpr (T == QG_Q4_K) {
+    moe_dequant8_q4_K(w, ib, part, out);
+  } else {
+    moe_dequant8_q6_K(w, ib, part, out);
+  }
+}
+
+// One output row per workgroup over k = ITERS * QGEMV_THREADS * 8 activations.
+template <int T1, int T2, int ITERS>
+__device__ __forceinline__ void qgemv_pair_fixed(const __nv_bfloat16 *__restrict__ x, const int m,
+                                                 const void *__restrict__ w1, const int r1, const int act1,
+                                                 const float scale1, __nv_bfloat16 *__restrict__ y1,
+                                                 const void *__restrict__ w2, const int r2,
+                                                 __nv_bfloat16 *__restrict__ y2) {
+  constexpr int k = ITERS * QGEMV_THREADS * 8;
+  const int row = blockIdx.x;
+  if (row >= r1 + r2) {
+    return;
+  }
+  const bool first = row < r1;
+  float wv[ITERS][8];
+  if (first) {
+#pragma unroll
+    for (int i = 0; i < ITERS; ++i) {
+      qg_dequant8_t<T1>(w1, k / (T1 >= QG_Q4_K ? 256 : 32), row, threadIdx.x + i * QGEMV_THREADS, wv[i]);
+    }
+  } else {
+#pragma unroll
+    for (int i = 0; i < ITERS; ++i) {
+      qg_dequant8_t<T2>(w2, k / (T2 >= QG_Q4_K ? 256 : 32), row - r1, threadIdx.x + i * QGEMV_THREADS,
+                        wv[i]);
+    }
+  }
+  float acc[QGEMV_MAX_ROWS] = {};
+#pragma unroll
+  for (int b = 0; b < QGEMV_MAX_ROWS; ++b) {
+    if (b < m) {
+      float xv[ITERS][8];
+#pragma unroll
+      for (int i = 0; i < ITERS; ++i) {
+        qg_load8(x + (int64_t)b * k + (threadIdx.x + i * QGEMV_THREADS) * 8, xv[i]);
+      }
+      // Per-chunk sums, then the running total: the generic kernel's order, so results match.
+#pragma unroll
+      for (int i = 0; i < ITERS; ++i) {
+        float d = 0.f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          d += wv[i][j] * xv[i][j];
+        }
+        acc[b] += d;
+      }
+    }
+  }
+  __shared__ float partial[QGEMV_MAX_ROWS][QGEMV_THREADS / 32];
+  const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+#pragma unroll
+  for (int b = 0; b < QGEMV_MAX_ROWS; ++b) {
+    if (b < m) {
+      float v = acc[b];
+      for (int off = 16; off > 0; off >>= 1) {
+        v += __shfl_xor_sync(0xffffffff, v, off, 32);
+      }
+      if (lane == 0) {
+        partial[b][warp] = v;
+      }
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x < m) {
+    const int b = threadIdx.x;
+    float v = 0.f;
+#pragma unroll
+    for (int i = 0; i < QGEMV_THREADS / 32; ++i) {
+      v += partial[b][i];
+    }
+    if (first) {
+      if (act1 == 1) {
+        v *= scale1;
+        v = v / (1.f + __expf(-v));
+      }
+      y1[(int64_t)b * r1 + row] = __float2bfloat16(v);
+    } else {
+      y2[(int64_t)b * r2 + row - r1] = __float2bfloat16(v);
+    }
+  }
+}
+
+// Same signature as qgemv_pair_bf16_r1; `k`, `t1` and `t2` are fixed by the name.
+#define QG_PAIR_FIXED(NAME, T1, T2, ITERS)                                                         \
+  extern "C" __global__ void __launch_bounds__(QGEMV_THREADS) NAME(                                \
+      const __nv_bfloat16 *__restrict__ x, const int m, const int k, const void *__restrict__ w1,   \
+      const int t1, const int r1, const int act1, const float scale1, __nv_bfloat16 *__restrict__ y1, \
+      const void *__restrict__ w2, const int t2, const int r2, __nv_bfloat16 *__restrict__ y2) {     \
+    qgemv_pair_fixed<T1, T2, ITERS>(x, m, w1, r1, act1, scale1, y1, w2, r2, y2);                   \
+  }
+QG_PAIR_FIXED(qgemv_pair_bf16_k10240_q4k_q4k, QG_Q4_K, QG_Q4_K, 5)
+QG_PAIR_FIXED(qgemv_pair_bf16_k10240_q6k_q4k, QG_Q6_K, QG_Q4_K, 5)
+
+// qgemv_gate_mean_bf16 for GROUPS streams over k = ITERS * (32 / GROUPS) * 8.
+template <int T, int GROUPS, int ITERS>
+__device__ __forceinline__ void qgemv_gate_mean_fixed(const __nv_bfloat16 *__restrict__ lo, const int m,
+                                                      const void *__restrict__ w,
+                                                      const __nv_bfloat16 *__restrict__ xn, const int hidden,
+                                                      __nv_bfloat16 *__restrict__ out) {
+  constexpr int per = 32 / GROUPS;
+  constexpr int k = ITERS * per * 8;
+  constexpr int qk = T >= QG_Q4_K ? 256 : 32;
+  const int lane = threadIdx.x % 32;
+  const int h = blockIdx.x * QG_GATE_WARPS + threadIdx.x / 32;
+  if (h >= hidden) {
+    return;
+  }
+  const int s = lane / per;
+  const int sub = lane % per;
+  const int64_t row = (int64_t)s * hidden + h;
+  float wv[ITERS][8];
+#pragma unroll
+  for (int i = 0; i < ITERS; ++i) {
+    qg_dequant8_t<T>(w, k / qk, row, sub + i * per, wv[i]);
+  }
+  float acc[QGEMV_MAX_ROWS] = {};
+#pragma unroll
+  for (int b = 0; b < QGEMV_MAX_ROWS; ++b) {
+    if (b < m) {
+      float xv[ITERS][8];
+#pragma unroll
+      for (int i = 0; i < ITERS; ++i) {
+        qg_load8(lo + (int64_t)b * k + (sub + i * per) * 8, xv[i]);
+      }
+#pragma unroll
+      for (int i = 0; i < ITERS; ++i) {
+        float d = 0.f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          d += wv[i][j] * xv[i][j];
+        }
+        acc[b] += d;
+      }
+    }
+  }
+  float mix[QGEMV_MAX_ROWS] = {};
+#pragma unroll
+  for (int b = 0; b < QGEMV_MAX_ROWS; ++b) {
+    if (b < m) {
+      float v = acc[b];
+      for (int off = per / 2; off > 0; off >>= 1) {
+        v += __shfl_xor_sync(0xffffffff, v, off, 32);
+      }
+      float g = 0.f;
+      if (sub == 0) {
+        g = __bfloat162float(xn[(int64_t)b * GROUPS * hidden + row]) / (1.f + __expf(-v));
+      }
+      for (int off = 16; off > 0; off >>= 1) {
+        g += __shfl_xor_sync(0xffffffff, g, off, 32);
+      }
+      mix[b] = g;
+    }
+  }
+#pragma unroll
+  for (int b = 0; b < QGEMV_MAX_ROWS; ++b) {
+    if (b < m && lane == b) {
+      out[(int64_t)b * hidden + h] = __float2bfloat16(mix[b] / GROUPS);
+    }
+  }
+}
+
+// Same signature as qgemv_gate_mean_bf16; `k`, `t` and `groups` are fixed by the name.
+#define QG_GATE_MEAN_FIXED(NAME, T, GROUPS, ITERS)                                                 \
+  extern "C" __global__ void __launch_bounds__(QG_GATE_WARPS * 32) NAME(                           \
+      const __nv_bfloat16 *__restrict__ lo, const int m, const int k, const void *__restrict__ w,   \
+      const int t, const __nv_bfloat16 *__restrict__ xn, const int groups, const int hidden,       \
+      __nv_bfloat16 *__restrict__ out) {                                                           \
+    qgemv_gate_mean_fixed<T, GROUPS, ITERS>(lo, m, w, xn, hidden, out);                            \
+  }
+QG_GATE_MEAN_FIXED(qgemv_gate_mean_bf16_k320_g4_q5_0, QG_Q5_0, 4, 5)
