@@ -36,6 +36,9 @@ pub struct PeerAllReduce {
     opened: Vec<u64>,
     peers: HipSlice<u64>,
     epoch: HipSlice<i32>,
+    /// Two monotonic counters for kernels that run the exchange with many workgroups: tickets
+    /// taken at entry (the epoch is `ticket / rows + 1`) and rows pushed so far.
+    counters: HipSlice<u32>,
 }
 
 impl std::fmt::Debug for PeerAllReduce {
@@ -135,6 +138,7 @@ impl PeerAllReduceSetup {
             .collect::<Vec<_>>();
         let peers = self.device.clone_htod(&table)?;
         let epoch = self.device.alloc_zeros::<i32>(1)?;
+        let counters = self.device.alloc_zeros::<u32>(2)?;
         Ok(PeerAllReduce {
             device: self.device.clone(),
             rank: self.rank,
@@ -144,6 +148,7 @@ impl PeerAllReduceSetup {
             opened,
             peers,
             epoch,
+            counters,
         })
     }
 
@@ -168,7 +173,37 @@ impl PeerAllReduceSetup {
     }
 }
 
+/// The device-side pieces of a [`PeerAllReduce`], for kernels that run the exchange
+/// themselves (fused with the work that consumes the reduced values). The buffers follow the
+/// layout `peer_allreduce.cu` describes; `epoch` must advance by one per exchange.
+#[derive(Clone, Copy, Debug)]
+pub struct PeerRawHandles {
+    /// `world` data pointers, then `world` flag pointers.
+    pub peers: u64,
+    pub epoch: u64,
+    /// Two u32 counters (tickets, rows pushed), zero at creation.
+    pub counters: u64,
+    pub rank: u32,
+    pub world: u32,
+    pub max_elems: u32,
+}
+
 impl PeerAllReduce {
+    pub fn raw_handles(&self) -> PeerRawHandles {
+        PeerRawHandles {
+            peers: self.peers.device_ptr(),
+            epoch: self.epoch.device_ptr(),
+            counters: self.counters.device_ptr(),
+            rank: self.rank as u32,
+            world: self.world as u32,
+            max_elems: self.max_elems as u32,
+        }
+    }
+
+    pub fn max_elems(&self) -> usize {
+        self.max_elems
+    }
+
     /// Whether `xs` is a reduction this path takes.
     pub fn supports(&self, xs: &Tensor) -> bool {
         xs.dtype() == DType::BF16
