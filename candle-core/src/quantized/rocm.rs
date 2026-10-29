@@ -832,9 +832,7 @@ impl QRocmStorage {
         let total_rows = batch * input_dim1;
         let k_padded = pad(k, MATRIX_ROW_PADDING);
         let row_bytes = k_padded / GgmlDType::Q8_1.block_size() * GgmlDType::Q8_1.type_size();
-        let shared = (input_dim1 == 1)
-            .then(|| SharedQ8Activation::new(dev, x_ptr, dst_tag, k, batch))
-            .transpose()?;
+        let shared = Some(SharedQ8Activation::new(dev, x_ptr, dst_tag, k, total_rows)).transpose()?;
         let mut own_q8_1: Option<HipSlice<u8>> = None;
         let x_q8_1: u64 = match &shared {
             Some(shared) => shared.ptr,
@@ -878,8 +876,21 @@ impl QRocmStorage {
             S::F32(s) => s.device_ptr(),
             _ => unreachable!(),
         };
+        // The GLU kernel with an extra table also writes its output's q8_1 form (32 rows per
+        // block), left as the shared activation for the down projection that follows.
+        let glu_q8 = glu.is_some() && extra.is_some() && reduce.is_none() && n % 32 == 0;
+        // The down projection reads rows of pad(n, MATRIX_ROW_PADDING) / 32 blocks.
+        let q8_row_blocks = pad(n, MATRIX_ROW_PADDING) / GgmlDType::Q8_1.block_size();
+        let out_q8 = if glu_q8 {
+            Some(unsafe {
+                dev.alloc::<u8>(batch * topk * q8_row_blocks * GgmlDType::Q8_1.type_size())?
+            })
+        } else {
+            None
+        };
         let name = match (glu, extra, reduce) {
             (None, Some(_), Some(_)) => format!("indexed_moe_xr_{tag}_{dst_tag}"),
+            (Some(_), Some(_), _) if glu_q8 => format!("indexed_moe_glu_xq8_{tag}_{dst_tag}"),
             (Some(_), Some(_), _) => format!("indexed_moe_glu_x_{tag}_{dst_tag}"),
             (Some(_), None, _) => format!("indexed_moe_glu_{tag}_{dst_tag}"),
             (None, Some(_), None) => format!("indexed_moe_x_{tag}_{dst_tag}"),
@@ -887,10 +898,10 @@ impl QRocmStorage {
         };
         let func = dev.get_or_load_func(&name, &kernels::QUANTIZED)?;
         // One output row per warp.
-        const ROWS_PER_BLOCK: usize = 4;
+        let rows_per_block: usize = if glu_q8 { 32 } else { 4 };
         let cfg = LaunchConfig {
-            grid_dim: (n.div_ceil(ROWS_PER_BLOCK) as u32, batch as u32, out_slots as u32),
-            block_dim: (WARP_SIZE as u32, ROWS_PER_BLOCK as u32, 1),
+            grid_dim: (n.div_ceil(rows_per_block) as u32, batch as u32, out_slots as u32),
+            block_dim: (WARP_SIZE as u32, rows_per_block as u32, 1),
             shared_mem_bytes: 0,
         };
         let act = glu.map_or(0i32, |(_, act)| act);
@@ -905,6 +916,11 @@ impl QRocmStorage {
             builder.arg(slot_weights);
         }
         builder.arg(&out_ptr);
+        let q8_row_blocks_i32 = q8_row_blocks as i32;
+        if let Some(out_q8) = &out_q8 {
+            builder.arg(out_q8);
+            builder.arg(&q8_row_blocks_i32);
+        }
         barg!(
             builder,
             n as i32,
@@ -927,6 +943,16 @@ impl QRocmStorage {
         drop(own_q8_1);
         if let Some(shared) = shared {
             shared.keep();
+        }
+        if let Some(out_q8) = out_q8 {
+            // The key SharedQ8Activation::new computes for the down projection's rows.
+            let code = match dst_tag {
+                "bf16" => 0,
+                "f16" => 1,
+                _ => 2,
+            };
+            dev.hip_stream()
+                .set_derived((out_ptr, n, batch * topk * 4 + code), out_q8);
         }
         Ok((
             RocmStorage {

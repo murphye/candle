@@ -340,3 +340,120 @@ INDEXED_MOE_XR_ALL_DST(q3k, QK_K, QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot
 INDEXED_MOE_XR_ALL_DST(q4k, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1)
 INDEXED_MOE_XR_ALL_DST(q5k, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1)
 INDEXED_MOE_XR_ALL_DST(q6k, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1)
+
+// ---- GLU expert kernel that also writes its output's q8_1 form --------------------------------
+// 32 warps per block, one output row each, so the block's 32 consecutive rows of one
+// (token, slot) form one q8_1 block of the down projection's input; `q8_out` holds
+// `q8_row_blocks` blocks per (token, slot) row in task order (the MMVQ activation layout,
+// rows padded to the consumer's MATRIX_ROW_PADDING).
+struct MoeQ8Block {
+    __half d;
+    __half s;
+    int8_t qs[32];
+};
+
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda, typename dst_t>
+__device__ void indexed_moe_glu_q8(
+    const void * __restrict__ gate_weights,
+    const void * __restrict__ up_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    dst_t * __restrict__ all_outputs,
+    MoeQ8Block * __restrict__ q8_out,
+    const int q8_row_blocks,
+    const int n,
+    const int k,
+    const int k_padded,
+    const int input_dim1,
+    const int act,
+    const void * __restrict__ extra_gate,
+    const void * __restrict__ extra_up,
+    const int n_experts) {
+    __shared__ float vals[32];
+    const int task_id = blockIdx.y * gridDim.z + blockIdx.z;
+    const int input_idx = (input_dim1 == 1) ? blockIdx.y : task_id;
+    const unsigned int expert_id = indices[task_id];
+    const int row = blockIdx.x * 32 + threadIdx.y;
+    const size_t weight_expert_stride_bytes = (size_t)n * k / qk * sizeof(block_q_t);
+    const size_t input_task_stride_bytes = (size_t)k_padded / QK8_1 * sizeof(block_q8_1);
+    const bool routed = expert_id < (unsigned)n_experts;
+    const size_t off = (routed ? expert_id : expert_id - n_experts) * weight_expert_stride_bytes;
+    const block_q_t * wg = (const block_q_t *)((const char *)(routed ? gate_weights : extra_gate) + off);
+    const block_q_t * wu = (const block_q_t *)((const char *)(routed ? up_weights : extra_up) + off);
+    const block_q8_1 * x = (const block_q8_1 *)((const char *)all_inputs + input_idx * input_task_stride_bytes);
+    const int blocks_per_row_x = k / qk;
+    constexpr int blocks_per_iter = vdr * WARP_SIZE / qi;
+    float g = 0.0f, u = 0.0f;
+    if (row < n) {
+        for (int kbx = threadIdx.x / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk / QK8_1);
+            const int kqs = vdr * (threadIdx.x % (qi / vdr));
+            g += vec_dot_q_cuda(&wg[kbx + row * blocks_per_row_x], &x[kby], kqs);
+            u += vec_dot_q_cuda(&wu[kbx + row * blocks_per_row_x], &x[kby], kqs);
+        }
+    }
+    g = warp_reduce_sum(g);
+    u = warp_reduce_sum(u);
+    if (threadIdx.x == 0) {
+        float v = 0.0f;
+        if (row < n) {
+            const float a = act == 0
+                ? g / (1.0f + expf(-g))
+                : 0.5f * g * (1.0f + tanhf(0.7978845608f * (g + 0.044715f * g * g * g)));
+            const dst_t o = (dst_t)(a * u);
+            all_outputs[(size_t)task_id * n + row] = o;
+            v = (float)o;
+        }
+        vals[threadIdx.y] = v;
+    }
+    __syncthreads();
+    if (threadIdx.y == 0) {
+        const float xi = vals[threadIdx.x];
+        float amax = fabsf(xi);
+        float sum = xi;
+        for (int o = 16; o > 0; o >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o, 32));
+            sum += __shfl_xor_sync(0xffffffff, sum, o, 32);
+        }
+        const float d = amax / 127.0f;
+        // Rows are padded to the MMVQ activation row (k_padded of the consumer): `q8_row_blocks`.
+        MoeQ8Block * blk = q8_out + (size_t)task_id * q8_row_blocks + blockIdx.x;
+        blk->qs[threadIdx.x] = amax == 0.0f ? 0 : (int8_t)roundf(xi / d);
+        if (threadIdx.x == 0) {
+            blk->d = (__half)d;
+            blk->s = (__half)sum;
+        }
+    }
+}
+
+#define INDEXED_MOE_GLU_XQ8(QNAME, QK, QI, BLOCK, VDR, VEC_DOT, DST, DST_T) \
+extern "C" __global__ void __launch_bounds__(1024) indexed_moe_glu_xq8_##QNAME##_##DST( \
+    const void * __restrict__ gate_weights, \
+    const void * __restrict__ up_weights, \
+    const void * __restrict__ all_inputs, \
+    const unsigned int * __restrict__ indices, \
+    DST_T * __restrict__ all_outputs, \
+    void * __restrict__ q8_out, \
+    const int q8_row_blocks, \
+    const int n, \
+    const int k, \
+    const int k_padded, \
+    const int input_dim1, \
+    const int act, \
+    const void * __restrict__ extra_gate, \
+    const void * __restrict__ extra_up, \
+    const int n_experts) { \
+    indexed_moe_glu_q8<QK, QI, BLOCK, VDR, VEC_DOT, DST_T> \
+        (gate_weights, up_weights, all_inputs, indices, all_outputs, (MoeQ8Block *)q8_out, q8_row_blocks, n, k, k_padded, input_dim1, act, extra_gate, extra_up, n_experts); \
+}
+#define INDEXED_MOE_GLU_XQ8_ALL_DST(QNAME, QK, QI, BLOCK, VDR, VEC_DOT) \
+INDEXED_MOE_GLU_XQ8(QNAME, QK, QI, BLOCK, VDR, VEC_DOT, f32, float) \
+INDEXED_MOE_GLU_XQ8(QNAME, QK, QI, BLOCK, VDR, VEC_DOT, f16, __half) \
+INDEXED_MOE_GLU_XQ8(QNAME, QK, QI, BLOCK, VDR, VEC_DOT, bf16, __nv_bfloat16)
+
+INDEXED_MOE_GLU_XQ8_ALL_DST(q4_0, QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1)
+INDEXED_MOE_GLU_XQ8_ALL_DST(q5_0, QK5_0, QI5_0, block_q5_0, VDR_Q5_0_Q8_1_MMVQ, vec_dot_q5_0_q8_1)
+INDEXED_MOE_GLU_XQ8_ALL_DST(q8_0, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1)
+INDEXED_MOE_GLU_XQ8_ALL_DST(q4k, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1)
+INDEXED_MOE_GLU_XQ8_ALL_DST(q5k, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1)
+INDEXED_MOE_GLU_XQ8_ALL_DST(q6k, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1)
