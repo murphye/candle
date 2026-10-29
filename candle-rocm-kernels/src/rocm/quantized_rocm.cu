@@ -73,6 +73,76 @@ __device__ void indexed_moe_dst(
     }
 }
 
+// The down projection summed over a token's expert slots: each warp computes
+// output `row` of token `b` against every slot's expert and accumulates
+// slot_weights[b, j] * dot, writing `[batch, n]` directly (no per-slot
+// intermediate and no separate weighted reduction). Inputs are one q8_1 row per
+// (token, slot).
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda, typename dst_t>
+__device__ void indexed_moe_reduce_dst(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    const float * __restrict__ slot_weights,
+    dst_t * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int k_padded,
+    const int topk,
+    const void * __restrict__ extra_weights,
+    const int n_experts) {
+    const int b = blockIdx.y;
+    const int row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (row >= n) {
+        return;
+    }
+    const size_t weight_expert_stride_bytes = (size_t)n * k / qk * sizeof(block_q_t);
+    const size_t input_task_stride_bytes = (size_t)k_padded / QK8_1 * sizeof(block_q8_1);
+    const int blocks_per_row_x = k / qk;
+    constexpr int blocks_per_iter = vdr * WARP_SIZE / qi;
+    float acc = 0.0f;
+    for (int j = 0; j < topk; ++j) {
+        const int task = b * topk + j;
+        const unsigned int expert_id = indices[task];
+        const block_q_t * w = expert_id < (unsigned)n_experts
+            ? (const block_q_t *)((const char *)all_weights + expert_id * weight_expert_stride_bytes)
+            : (const block_q_t *)((const char *)extra_weights + (expert_id - n_experts) * weight_expert_stride_bytes);
+        const block_q8_1 * x = (const block_q8_1 *)((const char *)all_inputs + task * input_task_stride_bytes);
+        float tmp = 0.0f;
+        for (int kbx = threadIdx.x / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk / QK8_1);
+            const int kqs = vdr * (threadIdx.x % (qi / vdr));
+            tmp += vec_dot_q_cuda(&w[kbx + row * blocks_per_row_x], &x[kby], kqs);
+        }
+        tmp = warp_reduce_sum(tmp);
+        acc = fmaf(slot_weights[task], tmp, acc);
+    }
+    if (threadIdx.x == 0) {
+        all_outputs[(size_t)b * n + row] = (dst_t)acc;
+    }
+}
+
+#define INDEXED_MOE_XR(QNAME, QK, QI, BLOCK, VDR, VEC_DOT, DST, DST_T) \
+extern "C" __global__ void indexed_moe_xr_##QNAME##_##DST( \
+    const void * __restrict__ all_weights, \
+    const void * __restrict__ all_inputs, \
+    const unsigned int * __restrict__ indices, \
+    const float * __restrict__ slot_weights, \
+    DST_T * __restrict__ all_outputs, \
+    const int n, \
+    const int k, \
+    const int k_padded, \
+    const int topk, \
+    const void * __restrict__ extra_weights, \
+    const int n_experts) { \
+    indexed_moe_reduce_dst<QK, QI, BLOCK, VDR, VEC_DOT, DST_T> \
+        (all_weights, all_inputs, indices, slot_weights, all_outputs, n, k, k_padded, topk, extra_weights, n_experts); \
+}
+#define INDEXED_MOE_XR_ALL_DST(QNAME, QK, QI, BLOCK, VDR, VEC_DOT) \
+INDEXED_MOE_XR(QNAME, QK, QI, BLOCK, VDR, VEC_DOT, f32, float) \
+INDEXED_MOE_XR(QNAME, QK, QI, BLOCK, VDR, VEC_DOT, f16, half) \
+INDEXED_MOE_XR(QNAME, QK, QI, BLOCK, VDR, VEC_DOT, bf16, __nv_bfloat16)
+
 // Gate and up projections of a GLU expert in one pass: each warp computes the
 // same row of both weights and writes act(gate) * up. act: 0 silu, 1 gelu (tanh).
 template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda, typename dst_t>
@@ -259,3 +329,14 @@ extern "C" __global__ void dequantize_v8_q5_0_bf16(const void *__restrict__ vx, 
                                                    const int64_t n_groups) {
     dequantize_v8_bf16<dequant8_q5_0>(vx, y, n_groups);
 }
+
+INDEXED_MOE_XR_ALL_DST(q4_0, QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1)
+INDEXED_MOE_XR_ALL_DST(q4_1, QK4_1, QI4_1, block_q4_1, VDR_Q4_1_Q8_1_MMVQ, vec_dot_q4_1_q8_1)
+INDEXED_MOE_XR_ALL_DST(q5_0, QK5_0, QI5_0, block_q5_0, VDR_Q5_0_Q8_1_MMVQ, vec_dot_q5_0_q8_1)
+INDEXED_MOE_XR_ALL_DST(q5_1, QK5_1, QI5_1, block_q5_1, VDR_Q5_1_Q8_1_MMVQ, vec_dot_q5_1_q8_1)
+INDEXED_MOE_XR_ALL_DST(q8_0, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1)
+INDEXED_MOE_XR_ALL_DST(q2k, QK_K, QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1)
+INDEXED_MOE_XR_ALL_DST(q3k, QK_K, QI3_K, block_q3_K, VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1)
+INDEXED_MOE_XR_ALL_DST(q4k, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1)
+INDEXED_MOE_XR_ALL_DST(q5k, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1)
+INDEXED_MOE_XR_ALL_DST(q6k, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1)

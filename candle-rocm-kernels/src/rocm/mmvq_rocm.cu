@@ -9,8 +9,8 @@ template <typename dst_t, int qk, int qi, typename block_q_t, int vdr,
 static __device__ void mmvq_warp_row_impl(const void *__restrict__ vx,
                                           const block_q8_1 *__restrict__ y,
                                           dst_t *__restrict__ dst, const int ncols_x,
-                                          const int nrows_x) {
-  const int row = blockIdx.x * blockDim.y + threadIdx.y;
+                                          const int nrows_x, const int block) {
+  const int row = block * blockDim.y + threadIdx.y;
   if (row >= nrows_x) {
     return;
   }
@@ -36,8 +36,9 @@ template <typename dst_t, int ncols_y, int qk, int qi, typename block_q_t, int v
 static __device__ void mmvq_warp_row_multi_impl(const void *__restrict__ vx,
                                                 const block_q8_1 *__restrict__ y,
                                                 dst_t *__restrict__ dst, const int ncols_x,
-                                                const int nrows_x, const int stride_col_y) {
-  const int row = blockIdx.x * blockDim.y + threadIdx.y;
+                                                const int nrows_x, const int stride_col_y,
+                                                const int block) {
+  const int row = block * blockDim.y + threadIdx.y;
   if (row >= nrows_x) {
     return;
   }
@@ -74,8 +75,9 @@ template <typename dst_t, int ncols_y, int nrows_w>
 static __device__ void mmvq_warp_row_multi_q4k_impl(const void *__restrict__ vx,
                                                     const block_q8_1 *__restrict__ y,
                                                     dst_t *__restrict__ dst, const int ncols_x,
-                                                    const int nrows_x, const int stride_col_y) {
-  const int row0 = (blockIdx.x * blockDim.y + threadIdx.y) * nrows_w;
+                                                    const int nrows_x, const int stride_col_y,
+                                                    const int block) {
+  const int row0 = (block * blockDim.y + threadIdx.y) * nrows_w;
   if (row0 >= nrows_x) {
     return;
   }
@@ -166,13 +168,13 @@ static __device__ void mmvq_warp_row_multi_q4k_impl(const void *__restrict__ vx,
       const void *__restrict__ vx, const void *__restrict__ vy, dst_c_type *__restrict__ dst,               \
       const int ncols_x, const int nrows_x, const int stride_col_y) {                                       \
     mmvq_warp_row_multi_q4k_impl<dst_c_type, n, 1>(vx, (const block_q8_1 *)vy, dst, ncols_x, nrows_x,      \
-                                                   stride_col_y);                                           \
+                                                   stride_col_y, blockIdx.x);                               \
   }                                                                                                         \
   extern "C" __global__ void mmvq_gguf_q4_k_##dst_tag##_warp_row##n##x2(                                    \
       const void *__restrict__ vx, const void *__restrict__ vy, dst_c_type *__restrict__ dst,               \
       const int ncols_x, const int nrows_x, const int stride_col_y) {                                       \
     mmvq_warp_row_multi_q4k_impl<dst_c_type, n, 2>(vx, (const block_q8_1 *)vy, dst, ncols_x, nrows_x,      \
-                                                   stride_col_y);                                           \
+                                                   stride_col_y, blockIdx.x);                               \
   }
 #define MMVQ_WARP_ROW_MULTI_Q4K_DST(dst_tag, dst_c_type)                                                  \
   MMVQ_WARP_ROW_MULTI_Q4K_ENTRY(dst_tag, dst_c_type, 2)                                                   \
@@ -188,7 +190,7 @@ static __device__ void mmvq_warp_row_multi_q4k_impl(const void *__restrict__ vx,
       const void *__restrict__ vx, const void *__restrict__ vy, dst_c_type *__restrict__ dst,               \
       const int ncols_x, const int nrows_x, const int stride_col_y) {                                       \
     mmvq_warp_row_multi_impl<dst_c_type, n, qk_val, qi_val, block_q_t, vdr_val, vec_dot>(                   \
-        vx, (const block_q8_1 *)vy, dst, ncols_x, nrows_x, stride_col_y);                                   \
+        vx, (const block_q8_1 *)vy, dst, ncols_x, nrows_x, stride_col_y, blockIdx.x);                       \
   }
 
 #define MMVQ_WARP_ROW_MULTI_DST(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, dst_tag, dst_c_type)    \
@@ -205,7 +207,7 @@ static __device__ void mmvq_warp_row_multi_q4k_impl(const void *__restrict__ vx,
       const void *__restrict__ vx, const void *__restrict__ vy, dst_c_type *__restrict__ dst,     \
       const int ncols_x, const int nrows_x) {                                                     \
     mmvq_warp_row_impl<dst_c_type, qk_val, qi_val, block_q_t, vdr_val, vec_dot>(                  \
-        vx, (const block_q8_1 *)vy, dst, ncols_x, nrows_x);                                       \
+        vx, (const block_q8_1 *)vy, dst, ncols_x, nrows_x, blockIdx.x);                           \
   }
 
 #define MMVQ_WARP_ROW_SET(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot)                       \
@@ -231,3 +233,104 @@ MMVQ_WARP_ROW_MULTI_Q4K_DST(f16, half)
 MMVQ_WARP_ROW_MULTI_Q4K_DST(f32, float)
 MMVQ_WARP_ROW_SET(q5_k, block_q5_K, QK_K, QI5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1)
 MMVQ_WARP_ROW_SET(q6_k, block_q6_K, QK_K, QI6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1)
+
+// ---- Several weight tables against one quantized activation in a single launch -------------
+// Decode steps run groups of projections over the same activations (a GDN layer's qkv, z, a
+// and b; a QSA layer's q, kv and indexer): each was its own launch, and in a HIP graph every
+// node costs a few microseconds of dispatch. One grid covers all tables, a contiguous range of
+// blocks per table, each block dispatching on its table's format.
+#define MMVQ_MULTI_MAX_SEGMENTS 4
+#define MMVQ_MULTI_TAG_Q4_0 0
+#define MMVQ_MULTI_TAG_Q5_0 1
+#define MMVQ_MULTI_TAG_Q8_0 2
+#define MMVQ_MULTI_TAG_Q4_K 3
+#define MMVQ_MULTI_TAG_Q5_K 4
+#define MMVQ_MULTI_TAG_Q6_K 5
+
+struct MmvqMultiSegments {
+  const void *vx[MMVQ_MULTI_MAX_SEGMENTS];
+  void *dst[MMVQ_MULTI_MAX_SEGMENTS];
+  int nrows[MMVQ_MULTI_MAX_SEGMENTS];
+  int block_start[MMVQ_MULTI_MAX_SEGMENTS + 1];
+  int tag[MMVQ_MULTI_MAX_SEGMENTS];
+  int x2[MMVQ_MULTI_MAX_SEGMENTS];
+  int count;
+};
+
+template <typename dst_t, int ncols_y, int qk, int qi, typename block_q_t, int vdr,
+          vec_dot_q_cuda_t vec_dot>
+static __device__ __forceinline__ void mmvq_multi_dispatch(const void *vx, const block_q8_1 *y,
+                                                           dst_t *dst, const int ncols_x,
+                                                           const int nrows_x, const int stride_col_y,
+                                                           const int block) {
+  if constexpr (ncols_y == 1) {
+    mmvq_warp_row_impl<dst_t, qk, qi, block_q_t, vdr, vec_dot>(vx, y, dst, ncols_x, nrows_x, block);
+  } else {
+    mmvq_warp_row_multi_impl<dst_t, ncols_y, qk, qi, block_q_t, vdr, vec_dot>(
+        vx, y, dst, ncols_x, nrows_x, stride_col_y, block);
+  }
+}
+
+template <typename dst_t, int ncols_y>
+static __device__ void mmvq_multi_impl(const MmvqMultiSegments s, const block_q8_1 *__restrict__ y,
+                                       const int ncols_x, const int stride_col_y) {
+  int seg = 0;
+  while (seg + 1 < s.count && (int)blockIdx.x >= s.block_start[seg + 1]) {
+    ++seg;
+  }
+  const int block = blockIdx.x - s.block_start[seg];
+  const void *vx = s.vx[seg];
+  dst_t *dst = reinterpret_cast<dst_t *>(s.dst[seg]);
+  const int nrows = s.nrows[seg];
+  switch (s.tag[seg]) {
+  case MMVQ_MULTI_TAG_Q4_0:
+    mmvq_multi_dispatch<dst_t, ncols_y, QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1>(
+        vx, y, dst, ncols_x, nrows, stride_col_y, block);
+    break;
+  case MMVQ_MULTI_TAG_Q5_0:
+    mmvq_multi_dispatch<dst_t, ncols_y, QK5_0, QI5_0, block_q5_0, VDR_Q5_0_Q8_1_MMVQ, vec_dot_q5_0_q8_1>(
+        vx, y, dst, ncols_x, nrows, stride_col_y, block);
+    break;
+  case MMVQ_MULTI_TAG_Q8_0:
+    mmvq_multi_dispatch<dst_t, ncols_y, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>(
+        vx, y, dst, ncols_x, nrows, stride_col_y, block);
+    break;
+  case MMVQ_MULTI_TAG_Q4_K:
+    if constexpr (ncols_y == 1) {
+      mmvq_warp_row_impl<dst_t, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>(
+          vx, y, dst, ncols_x, nrows, block);
+    } else if (s.x2[seg]) {
+      mmvq_warp_row_multi_q4k_impl<dst_t, ncols_y, 2>(vx, y, dst, ncols_x, nrows, stride_col_y, block);
+    } else {
+      mmvq_warp_row_multi_q4k_impl<dst_t, ncols_y, 1>(vx, y, dst, ncols_x, nrows, stride_col_y, block);
+    }
+    break;
+  case MMVQ_MULTI_TAG_Q5_K:
+    mmvq_multi_dispatch<dst_t, ncols_y, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1>(
+        vx, y, dst, ncols_x, nrows, stride_col_y, block);
+    break;
+  default:
+    mmvq_multi_dispatch<dst_t, ncols_y, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>(
+        vx, y, dst, ncols_x, nrows, stride_col_y, block);
+    break;
+  }
+}
+
+#define MMVQ_MULTI_ENTRY(dst_tag, dst_c_type, n)                                                   \
+  extern "C" __global__ void mmvq_gguf_multi_##dst_tag##_seg##n(                                   \
+      const MmvqMultiSegments segments, const void *__restrict__ vy, const int ncols_x,            \
+      const int stride_col_y) {                                                                    \
+    mmvq_multi_impl<dst_c_type, n>(segments, (const block_q8_1 *)vy, ncols_x, stride_col_y);       \
+  }
+#define MMVQ_MULTI_DST(dst_tag, dst_c_type)                                                        \
+  MMVQ_MULTI_ENTRY(dst_tag, dst_c_type, 1)                                                         \
+  MMVQ_MULTI_ENTRY(dst_tag, dst_c_type, 2)                                                         \
+  MMVQ_MULTI_ENTRY(dst_tag, dst_c_type, 3)                                                         \
+  MMVQ_MULTI_ENTRY(dst_tag, dst_c_type, 4)                                                         \
+  MMVQ_MULTI_ENTRY(dst_tag, dst_c_type, 5)                                                         \
+  MMVQ_MULTI_ENTRY(dst_tag, dst_c_type, 6)                                                         \
+  MMVQ_MULTI_ENTRY(dst_tag, dst_c_type, 7)                                                         \
+  MMVQ_MULTI_ENTRY(dst_tag, dst_c_type, 8)
+MMVQ_MULTI_DST(bf16, __nv_bfloat16)
+MMVQ_MULTI_DST(f16, half)
+MMVQ_MULTI_DST(f32, float)

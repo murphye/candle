@@ -636,7 +636,7 @@ impl QRocmStorage {
         ids: &RocmStorage,
         ids_l: &crate::Layout,
     ) -> Result<(RocmStorage, crate::Shape)> {
-        self.indexed_moe(None, None, self_shape, input, input_l, ids, ids_l)
+        self.indexed_moe(None, None, None, self_shape, input, input_l, ids, ids_l)
     }
 
     /// `act(x @ self[ids]^T) * (x @ up[ids]^T)` in one kernel, for GLU experts whose
@@ -655,7 +655,7 @@ impl QRocmStorage {
         if up.dtype() != self.dtype() || up.data.len != self.data.len {
             crate::bail!("indexed_moe_glu_forward: gate and up weights differ");
         }
-        self.indexed_moe(Some((up, act)), None, self_shape, input, input_l, ids, ids_l)
+        self.indexed_moe(Some((up, act)), None, None, self_shape, input, input_l, ids, ids_l)
     }
 
     /// Grouped GEMM over the experts for prefill-sized batches: `x: [tokens, 1 | topk, k]`,
@@ -778,10 +778,13 @@ impl QRocmStorage {
         )))
     }
 
+    /// `reduce`: the f32 `[batch, topk]` slot weights' device address; the launch then sums
+    /// each token's slots in the kernel and returns `[batch, 1, n]` (needs `extra`, no `glu`).
     fn indexed_moe(
         &self,
         glu: Option<(&QRocmStorage, i32)>,
         extra: Option<(&QRocmStorage, Option<&QRocmStorage>, usize)>,
+        reduce: Option<u64>,
         self_shape: &crate::Shape,
         input: &RocmStorage,
         input_l: &crate::Layout,
@@ -799,6 +802,9 @@ impl QRocmStorage {
         let (_, n, k) = self_shape.dims3()?;
         let (batch, input_dim1, in_k) = input_l.shape().dims3()?;
         let (id_batch, topk) = ids_l.shape().dims2()?;
+        if reduce.is_some() && (glu.is_some() || extra.is_none() || input_dim1 != topk) {
+            crate::bail!("indexed_moe_forward: the reducing launch needs per-slot inputs and an extra table");
+        }
         if in_k != k || id_batch != batch || (input_dim1 != 1 && input_dim1 != topk) {
             crate::bail!(
                 "indexed_moe_forward shape mismatch: w {self_shape:?}, x {:?}, ids {:?}",
@@ -845,7 +851,8 @@ impl QRocmStorage {
         unsafe { builder.launch(cfg) }.w()?;
 
         // Every output element is written, so the buffer needs no zeroing.
-        let out_len = batch * topk * n;
+        let out_slots = if reduce.is_some() { 1 } else { topk };
+        let out_len = batch * out_slots * n;
         let out = match input.dtype() {
             crate::DType::BF16 => S::BF16(unsafe { dev.alloc::<half::bf16>(out_len)? }),
             crate::DType::F16 => S::F16(unsafe { dev.alloc::<f16>(out_len)? }),
@@ -857,17 +864,18 @@ impl QRocmStorage {
             S::F32(s) => s.device_ptr(),
             _ => unreachable!(),
         };
-        let name = match (glu, extra) {
-            (Some(_), Some(_)) => format!("indexed_moe_glu_x_{tag}_{dst_tag}"),
-            (Some(_), None) => format!("indexed_moe_glu_{tag}_{dst_tag}"),
-            (None, Some(_)) => format!("indexed_moe_x_{tag}_{dst_tag}"),
-            (None, None) => format!("indexed_moe_{tag}_{dst_tag}"),
+        let name = match (glu, extra, reduce) {
+            (None, Some(_), Some(_)) => format!("indexed_moe_xr_{tag}_{dst_tag}"),
+            (Some(_), Some(_), _) => format!("indexed_moe_glu_x_{tag}_{dst_tag}"),
+            (Some(_), None, _) => format!("indexed_moe_glu_{tag}_{dst_tag}"),
+            (None, Some(_), None) => format!("indexed_moe_x_{tag}_{dst_tag}"),
+            (None, None, _) => format!("indexed_moe_{tag}_{dst_tag}"),
         };
         let func = dev.get_or_load_func(&name, &kernels::QUANTIZED)?;
         // One output row per warp.
         const ROWS_PER_BLOCK: usize = 4;
         let cfg = LaunchConfig {
-            grid_dim: (n.div_ceil(ROWS_PER_BLOCK) as u32, batch as u32, topk as u32),
+            grid_dim: (n.div_ceil(ROWS_PER_BLOCK) as u32, batch as u32, out_slots as u32),
             block_dim: (WARP_SIZE as u32, ROWS_PER_BLOCK as u32, 1),
             shared_mem_bytes: 0,
         };
@@ -879,6 +887,9 @@ impl QRocmStorage {
         }
         builder.arg(&x_q8_1);
         builder.arg(&ids_ptr);
+        if let Some(slot_weights) = &reduce {
+            builder.arg(slot_weights);
+        }
         builder.arg(&out_ptr);
         barg!(
             builder,
@@ -904,7 +915,7 @@ impl QRocmStorage {
                 slice: out,
                 device: dev.clone(),
             },
-            crate::Shape::from((batch, topk, n)),
+            crate::Shape::from((batch, out_slots, n)),
         ))
     }
 
@@ -1224,6 +1235,217 @@ fn dequantize_kernel_available(dtype: GgmlDType) -> bool {
     )
 }
 
+/// The q8_1 quantization of a decode activation, padded to MATRIX_ROW_PADDING. Projections of
+/// the same activations back to back (q/k/v, gate/up) reuse the previous quantization through
+/// the stream's derived-buffer slot; [`Self::keep`] records this one for the next matmul.
+struct SharedQ8Activation {
+    ptr: u64,
+    fresh: Option<HipSlice<u8>>,
+    key: (u64, usize, usize),
+    stream: std::sync::Arc<crate::rocm_backend::hip::HipStream>,
+}
+
+impl SharedQ8Activation {
+    fn new(dev: &RocmDevice, rhs_ptr: u64, dst_tag: &'static str, k: usize, b_size: usize) -> Result<Self> {
+        let k_padded = pad(k, MATRIX_ROW_PADDING);
+        let stream = dev.hip_stream();
+        let dtype_code = match dst_tag {
+            "bf16" => 0,
+            "f16" => 1,
+            _ => 2,
+        };
+        let key = (rhs_ptr, k, b_size * 4 + dtype_code);
+        let (ptr, fresh) = match stream.derived(key) {
+            Some(ptr) => (ptr, None),
+            None => {
+                let row_bytes =
+                    k_padded / GgmlDType::Q8_1.block_size() * GgmlDType::Q8_1.type_size();
+                let y = unsafe { dev.alloc::<u8>(b_size * row_bytes)? };
+                let func = dev.get_or_load_func_keyed(
+                    ("quantize_q8_1", dst_tag, ""),
+                    0,
+                    &kernels::MMVQ,
+                    || format!("mmvq_gguf_quantize_q8_1_{dst_tag}"),
+                )?;
+                let cfg = LaunchConfig {
+                    grid_dim: (
+                        ceil_div(k_padded, CUDA_QUANTIZE_BLOCK_SIZE) as u32,
+                        b_size as u32,
+                        1,
+                    ),
+                    block_dim: (CUDA_QUANTIZE_BLOCK_SIZE as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut builder = func.builder();
+                builder.arg(&rhs_ptr);
+                builder.arg(&y);
+                barg!(builder, k as i32, k_padded as i32);
+                unsafe { builder.launch(cfg) }.w()?;
+                (y.device_ptr(), Some(y))
+            }
+        };
+        Ok(Self {
+            ptr,
+            fresh,
+            key,
+            stream,
+        })
+    }
+
+    /// Only the matmul's own output was written since the quantization: keep it for the next.
+    fn keep(self) {
+        match self.fresh {
+            Some(y) => self.stream.set_derived(self.key, y),
+            None => self.stream.renew_derived(),
+        }
+    }
+}
+
+/// Mirrors `MmvqMultiSegments` in mmvq_rocm.cu.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MmvqMultiSegments {
+    vx: [u64; 4],
+    dst: [u64; 4],
+    nrows: [i32; 4],
+    block_start: [i32; 5],
+    tag: [i32; 4],
+    x2: [i32; 4],
+    count: i32,
+}
+unsafe impl crate::rocm_backend::hip::DeviceRepr for MmvqMultiSegments {}
+
+fn mmvq_multi_tag(dtype: GgmlDType) -> Option<i32> {
+    Some(match dtype {
+        GgmlDType::Q4_0 => 0,
+        GgmlDType::Q5_0 => 1,
+        GgmlDType::Q8_0 => 2,
+        GgmlDType::Q4K => 3,
+        GgmlDType::Q5K => 4,
+        GgmlDType::Q6K => 5,
+        _ => return None,
+    })
+}
+
+/// `x @ w^T` for up to four GGUF weights `[n_i, k]` over the same decode activations
+/// `x: [.., k]` (at most 8 rows) in one launch: one quantization of `x`, one grid with a block
+/// range per weight. Returns one `[.., n_i]` tensor per weight, or `None` when a weight's
+/// format, the shapes or the device don't fit (the caller then runs them one by one).
+pub fn fast_mmvq_multi(weights: &[&super::QTensor], x: &crate::Tensor) -> Result<Option<Vec<crate::Tensor>>> {
+    use crate::rocm_backend::RocmStorageSlice as S;
+    if weights.is_empty() || weights.len() > 4 {
+        return Ok(None);
+    }
+    let crate::Device::Rocm(dev) = x.device() else {
+        return Ok(None);
+    };
+    let k = x.dim(crate::D::Minus1)?;
+    let b_size = x.elem_count() / k;
+    if b_size == 0 || b_size > MMVQ_MAX_ROWS || k % 256 != 0 {
+        return Ok(None);
+    }
+    let mut storages = Vec::with_capacity(weights.len());
+    for w in weights {
+        let super::QStorage::Rocm(s) = &w.storage else {
+            return Ok(None);
+        };
+        let (n, wk) = w.shape().dims2()?;
+        if wk != k || n == 0 || mmvq_multi_tag(s.dtype).is_none() || !s.device().same_device(dev) {
+            return Ok(None);
+        }
+        storages.push((s, n));
+    }
+    let (x_storage, x_layout) = x.storage_and_layout();
+    let crate::Storage::Rocm(xs) = &*x_storage else {
+        return Ok(None);
+    };
+    let Some((o1, o2)) = x_layout.contiguous_offsets() else {
+        return Ok(None);
+    };
+    let (dst_tag, x_ptr) = match &xs.slice {
+        S::BF16(s) => ("bf16", s.slice(o1..o2).device_ptr()),
+        S::F16(s) => ("f16", s.slice(o1..o2).device_ptr()),
+        S::F32(s) => ("f32", s.slice(o1..o2).device_ptr()),
+        _ => return Ok(None),
+    };
+    let shared = SharedQ8Activation::new(dev, x_ptr, dst_tag, k, b_size)?;
+    let k_padded = pad(k, MATRIX_ROW_PADDING);
+    const ROWS_PER_BLOCK: usize = 4;
+    let mut segments = MmvqMultiSegments {
+        vx: [0; 4],
+        dst: [0; 4],
+        nrows: [0; 4],
+        block_start: [0; 5],
+        tag: [0; 4],
+        x2: [0; 4],
+        count: weights.len() as i32,
+    };
+    let mut outs = Vec::with_capacity(weights.len());
+    let mut blocks = 0usize;
+    for (i, (s, n)) in storages.iter().enumerate() {
+        let x2 = b_size > 1 && s.dtype == GgmlDType::Q4K && n % 2 == 0 && *n >= 2048;
+        let out = match x.dtype() {
+            crate::DType::BF16 => S::BF16(unsafe { dev.alloc::<half::bf16>(n * b_size)? }),
+            crate::DType::F16 => S::F16(unsafe { dev.alloc::<f16>(n * b_size)? }),
+            _ => S::F32(unsafe { dev.alloc::<f32>(n * b_size)? }),
+        };
+        segments.vx[i] = s.data.inner.device_ptr();
+        segments.dst[i] = match &out {
+            S::BF16(o) => o.device_ptr(),
+            S::F16(o) => o.device_ptr(),
+            S::F32(o) => o.device_ptr(),
+            _ => unreachable!(),
+        };
+        segments.nrows[i] = *n as i32;
+        segments.tag[i] = mmvq_multi_tag(s.dtype).expect("checked above");
+        segments.x2[i] = x2 as i32;
+        segments.block_start[i] = blocks as i32;
+        blocks += n.div_ceil(ROWS_PER_BLOCK * if x2 { 2 } else { 1 });
+        outs.push(out);
+    }
+    segments.block_start[weights.len()] = blocks as i32;
+    let func = dev.get_or_load_func_keyed(
+        ("mmvq_multi", dst_tag, ""),
+        b_size,
+        &kernels::MMVQ,
+        || format!("mmvq_gguf_multi_{dst_tag}_seg{b_size}"),
+    )?;
+    let cfg = LaunchConfig {
+        grid_dim: (blocks as u32, 1, 1),
+        block_dim: (WARP_SIZE as u32, ROWS_PER_BLOCK as u32, 1),
+        shared_mem_bytes: 0,
+    };
+    let stride_col_y = (k_padded / GgmlDType::Q8_1.block_size()) as i32;
+    let y_q8_1 = shared.ptr;
+    let mut builder = func.builder();
+    builder.arg(&segments);
+    builder.arg(&y_q8_1);
+    barg!(builder, k as i32, stride_col_y);
+    // SAFETY: ffi; every segment's shape, format and device were checked above.
+    unsafe { builder.launch(cfg) }.w()?;
+    shared.keep();
+    let mut lead = x.dims().to_vec();
+    lead.pop();
+    Ok(Some(
+        outs.into_iter()
+            .zip(storages.iter())
+            .map(|(slice, (_, n))| {
+                let mut dims = lead.clone();
+                dims.push(*n);
+                crate::Tensor::from_storage(
+                    crate::Storage::Rocm(RocmStorage {
+                        slice,
+                        device: dev.clone(),
+                    }),
+                    dims,
+                    crate::op::BackpropOp::none(),
+                    false,
+                )
+            })
+            .collect(),
+    ))
+}
+
 fn mmvq_tag(dtype: GgmlDType) -> Option<&'static str> {
     Some(match dtype {
         GgmlDType::Q4_0 => "q4_0",
@@ -1275,50 +1497,10 @@ impl QRocmStorage {
             _ => return Ok(None),
         };
 
-        // Quantize the activations to q8_1, padded to MATRIX_ROW_PADDING. Projections of the
-        // same activations back to back (q/k/v, gate/up) reuse the previous quantization.
         let k_padded = pad(k, MATRIX_ROW_PADDING);
-        let stream = dev.hip_stream();
-        let dtype_code = match dst_tag {
-            "bf16" => 0,
-            "f16" => 1,
-            _ => 2,
-        };
-        let q8_key = (rhs_ptr, k, b_size * 4 + dtype_code);
-        let (y_q8_1, fresh_q8_1) = match stream.derived(q8_key) {
-            Some(ptr) => (ptr, None),
-            None => {
-                let row_bytes =
-                    k_padded / GgmlDType::Q8_1.block_size() * GgmlDType::Q8_1.type_size();
-                let y = unsafe { dev.alloc::<u8>(b_size * row_bytes)? };
-                let func = dev.get_or_load_func_keyed(
-                    ("quantize_q8_1", dst_tag, ""),
-                    0,
-                    &kernels::MMVQ,
-                    || format!("mmvq_gguf_quantize_q8_1_{dst_tag}"),
-                )?;
-                let cfg = LaunchConfig {
-                    grid_dim: (
-                        ceil_div(k_padded, CUDA_QUANTIZE_BLOCK_SIZE) as u32,
-                        b_size as u32,
-                        1,
-                    ),
-                    block_dim: (CUDA_QUANTIZE_BLOCK_SIZE as u32, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                let mut builder = func.builder();
-                builder.arg(&rhs_ptr);
-                builder.arg(&y);
-                barg!(builder, k as i32, k_padded as i32);
-                unsafe { builder.launch(cfg) }.w()?;
-                (y.device_ptr(), Some(y))
-            }
-        };
-        // Only this matmul's own output was written since the quantization.
-        let keep_q8_1 = move || match fresh_q8_1 {
-            Some(y) => stream.set_derived(q8_key, y),
-            None => stream.renew_derived(),
-        };
+        let shared = SharedQ8Activation::new(dev, rhs_ptr, dst_tag, k, b_size)?;
+        let y_q8_1 = shared.ptr;
+        let keep_q8_1 = move || shared.keep();
 
         // Same launch shape as the CUDA launcher: two rows per block past batch 1.
         let weights = &self.data.inner;
@@ -1918,6 +2100,7 @@ pub fn indexed_moe_forward_with_extra(
     let (storage, shape) = w.indexed_moe(
         None,
         Some((e, None, n_experts)),
+        None,
         &out_shape,
         rocm_tensor_storage(&xs, "x")?,
         x.layout(),
@@ -1927,6 +2110,50 @@ pub fn indexed_moe_forward_with_extra(
     Ok(crate::Tensor::from_storage(
         crate::Storage::Rocm(storage),
         shape,
+        crate::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+/// [`indexed_moe_forward_with_extra`] summed over each token's slots in the kernel:
+/// `sum_j slot_weights[t, j] * (x[t, j] @ experts[ids[t, j]]^T)`, returning `[batch, n]`.
+/// `x: [batch, topk, k]`, `ids: [batch, topk]` u32, `slot_weights: [batch, topk]` f32.
+pub fn indexed_moe_forward_with_extra_reduce(
+    experts: &super::QTensor,
+    extra: &super::QTensor,
+    x: &crate::Tensor,
+    ids: &crate::Tensor,
+    slot_weights: &crate::Tensor,
+) -> Result<crate::Tensor> {
+    let (n_experts, out_shape) = extra_table_shapes(experts, extra, None)?;
+    let (w, e) = (rocm_qstorage(experts)?, rocm_qstorage(extra)?);
+    if slot_weights.dtype() != crate::DType::F32 || slot_weights.dims() != ids.dims() {
+        crate::bail!(
+            "indexed_moe_forward_with_extra_reduce: slot weights {:?} must be f32 and shaped like ids {:?}",
+            slot_weights.shape(),
+            ids.shape()
+        );
+    }
+    let slot_weights = slot_weights.contiguous()?;
+    let (xs, is, ws) = (x.storage(), ids.storage(), slot_weights.storage());
+    let weights_ptr = rocm_tensor_storage(&ws, "slot_weights")?
+        .as_rocm_slice::<f32>()?
+        .slice(slot_weights.layout().start_offset()..)
+        .device_ptr();
+    let (storage, shape) = w.indexed_moe(
+        None,
+        Some((e, None, n_experts)),
+        Some(weights_ptr),
+        &out_shape,
+        rocm_tensor_storage(&xs, "x")?,
+        x.layout(),
+        rocm_tensor_storage(&is, "ids")?,
+        ids.layout(),
+    )?;
+    let (batch, _, n) = shape.dims3()?;
+    Ok(crate::Tensor::from_storage(
+        crate::Storage::Rocm(storage),
+        (batch, n),
         crate::op::BackpropOp::none(),
         false,
     ))
@@ -1950,6 +2177,7 @@ pub fn indexed_moe_glu_forward_with_extra(
     let (storage, shape) = g.indexed_moe(
         Some((u, act)),
         Some((eg, Some(eu), n_experts)),
+        None,
         &out_shape,
         rocm_tensor_storage(&xs, "x")?,
         x.layout(),

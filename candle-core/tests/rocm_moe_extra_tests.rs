@@ -1,6 +1,9 @@
 #![cfg(feature = "rocm")]
 
-use candle_core::quantized::rocm::{indexed_moe_forward_with_extra, indexed_moe_glu_forward_with_extra};
+use candle_core::quantized::rocm::{
+    indexed_moe_forward_with_extra, indexed_moe_forward_with_extra_reduce,
+    indexed_moe_glu_forward_with_extra,
+};
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{DType, Device, Result, Tensor};
 
@@ -64,6 +67,41 @@ fn extra_expert_matches_concatenated_table() -> Result<()> {
             let scale = want.abs()?.max_all()?.to_scalar::<f32>()?;
             assert!(err <= scale / 64.0, "glu: extra-expert output differs by {err} at scale {scale}");
         }
+    }
+    Ok(())
+}
+
+/// The slot-reducing down kernel matches the per-slot outputs weighted and summed in f32.
+#[test]
+fn reducing_down_matches_weighted_sum() -> Result<()> {
+    let Ok(dev) = Device::new_rocm(0) else { return Ok(()) };
+    let (experts, n, k, tokens, topk) = (4usize, 64usize, 512usize, 3usize, 3usize);
+    for dtype in [GgmlDType::Q8_0, GgmlDType::Q5_0, GgmlDType::Q4K] {
+        let routed = weights(experts, n, k, 0.1)?;
+        let shared = weights(1, n, k, 0.7)?;
+        let q = |w: &Tensor| QTensor::quantize_onto(w, dtype, &dev);
+        let (q_routed, q_shared) = (q(&routed)?, q(&shared)?);
+        let ids = Tensor::from_vec(vec![0u32, 2, 4, 3, 1, 4, 2, 2, 4], (tokens, topk), &dev)?;
+        let slot_weights = Tensor::from_vec(
+            vec![0.5f32, 0.25, 1.0, 0.1, 0.6, 1.0, 0.3, 0.3, 1.0],
+            (tokens, topk),
+            &dev,
+        )?;
+        let xd = Tensor::from_vec(
+            (0..tokens * topk * k).map(|i| ((i as f32 * 0.017).sin()) * 0.5).collect::<Vec<_>>(),
+            (tokens, topk, k),
+            &dev,
+        )?
+        .to_dtype(DType::BF16)?;
+        let got = indexed_moe_forward_with_extra_reduce(&q_routed, &q_shared, &xd, &ids, &slot_weights)?
+            .to_dtype(DType::F32)?;
+        assert_eq!(got.dims(), [tokens, n]);
+        let per_slot = indexed_moe_forward_with_extra(&q_routed, &q_shared, &xd, &ids)?.to_dtype(DType::F32)?;
+        let want = per_slot.broadcast_mul(&slot_weights.unsqueeze(2)?)?.sum(1)?;
+        let err = (got - &want)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        let scale = want.abs()?.max_all()?.to_scalar::<f32>()?.max(1e-3);
+        // The per-slot reference rounds each slot to bf16 before the sum.
+        assert!(err / scale < 2e-2, "{dtype:?}: rel err {}", err / scale);
     }
     Ok(())
 }
