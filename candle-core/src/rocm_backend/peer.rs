@@ -16,6 +16,14 @@ pub const HANDLE_BYTES: usize = 64;
 /// The receive buffer starts with the flags, padded so the data stays aligned; small
 /// allocations may be carved out of shared blocks that IPC cannot export, so it is one.
 const FLAGS_BYTES: usize = 4096;
+/// Reductions of at least this many elements take the whole-GPU kernel (a 2 MiB bf16 tensor
+/// moves in ~80 us over PCIe 5.0 x16 when every workgroup pushes, far longer from one).
+pub const WIDE_MIN_ELEMS: usize = 1 << 16;
+const WIDE_BLOCK: usize = 256;
+/// Largest gather the one-workgroup gather kernel takes (vocab-sharded logits of a batch).
+pub const GATHER_MAX_ELEMS: usize = 1 << 20;
+const WIDE_MAX_BLOCKS: usize = 2048;
+const WIDE_REDUCE_MAX_BLOCKS: usize = 256;
 
 /// This rank's receive buffer, before the peers' buffers are opened.
 pub struct PeerAllReduceSetup {
@@ -212,9 +220,22 @@ impl PeerAllReduce {
             && xs.device().same_device(&crate::Device::Rocm(self.device.clone()))
     }
 
+    /// Whether `xs` is a gather this path takes: the gather kernel runs on one workgroup, so
+    /// it stops at [`GATHER_MAX_ELEMS`] however large the receive buffer is.
+    pub fn supports_gather(&self, xs: &Tensor) -> bool {
+        self.supports(xs) && xs.elem_count() <= GATHER_MAX_ELEMS
+    }
+
     /// The sum of `xs` over every rank; every rank must call this with the same shape.
+    /// Reductions from [`WIDE_MIN_ELEMS`] up run on the whole GPU (a stripe per workgroup, so
+    /// the pushes reach the link's bandwidth); smaller ones on one workgroup, where the cost
+    /// is latency.
     pub fn all_reduce(&self, xs: &Tensor) -> Result<Tensor> {
-        self.exchange(xs, "peer_allreduce_bf16", 1)
+        if xs.elem_count() >= WIDE_MIN_ELEMS {
+            self.exchange(xs, "peer_allreduce_bf16_wide", 1)
+        } else {
+            self.exchange(xs, "peer_allreduce_bf16", 1)
+        }
     }
 
     /// Every rank's `xs` stacked rank-major: `[world, ..xs.dims()]`.
@@ -241,7 +262,6 @@ impl PeerAllReduce {
             crate::bail!("peer all-reduce needs 16-byte aligned input");
         }
         let out = unsafe { self.device.alloc::<half::bf16>(n * out_mult)? };
-        let func = self.device.get_or_load_func(kernel, &kernels::PEER_ALLREDUCE)?;
         let y = out.device_ptr();
         let (n, max_elems, rank, world) = (
             n as i32,
@@ -249,6 +269,43 @@ impl PeerAllReduce {
             self.rank as i32,
             self.world as i32,
         );
+        let wide = kernel.ends_with("_wide");
+        // Wide: 16 bytes per lane per pass, enough workgroups to keep the link busy; the
+        // reduce launch reads local memory only and polls the flags first, so fewer.
+        let vectors = (n as usize).div_ceil(8);
+        let wide_cfg = |max_blocks: usize| LaunchConfig {
+            grid_dim: (vectors.div_ceil(WIDE_BLOCK).clamp(1, max_blocks) as u32, 1, 1),
+            block_dim: (WIDE_BLOCK as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let cfg = if wide {
+            wide_cfg(WIDE_REDUCE_MAX_BLOCKS)
+        } else {
+            LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (1024, 1, 1),
+                shared_mem_bytes: 0,
+            }
+        };
+        if wide {
+            // The push runs as its own launch so that no workgroup waits for a peer while
+            // workgroups of its own grid are still queued (see peer_allreduce.cu).
+            let push = self
+                .device
+                .get_or_load_func("peer_push_bf16_wide", &kernels::PEER_ALLREDUCE)?;
+            let mut builder = push.builder();
+            builder.arg(&x);
+            builder.arg(&n);
+            builder.arg(&max_elems);
+            builder.arg(&self.peers);
+            builder.arg(&rank);
+            builder.arg(&world);
+            builder.arg(&self.epoch);
+            builder.arg(&self.counters);
+            // SAFETY: ffi; the peers' buffers hold `max_elems` elements per slot and n <= max_elems.
+            unsafe { builder.launch(wide_cfg(WIDE_MAX_BLOCKS)) }.w()?;
+        }
+        let func = self.device.get_or_load_func(kernel, &kernels::PEER_ALLREDUCE)?;
         let mut builder = func.builder();
         builder.arg(&x);
         builder.arg(&y);
@@ -258,11 +315,9 @@ impl PeerAllReduce {
         builder.arg(&rank);
         builder.arg(&world);
         builder.arg(&self.epoch);
-        let cfg = LaunchConfig {
-            grid_dim: (1, 1, 1),
-            block_dim: (1024, 1, 1),
-            shared_mem_bytes: 0,
-        };
+        if wide {
+            builder.arg(&self.counters);
+        }
         // SAFETY: ffi; the peers' buffers hold `max_elems` elements per slot and n <= max_elems.
         unsafe { builder.launch(cfg) }.w()?;
         drop(guard);
