@@ -140,30 +140,27 @@ static __device__ __forceinline__ void moe_dequant8_q4_K(const void *vx, int64_t
 }
 
 static __device__ __forceinline__ void moe_load8_q4_K(const void *vx, int64_t ib, int part, moe_raw8 &r) {
-    // dm (4 bytes), the twelve scale bytes and the eight quant bytes: all 4-byte aligned.
-    const uint32_t *b = (const uint32_t *)((const uint8_t *)vx + ib * (int64_t)sizeof(block_q4_K));
+    // dm (4 bytes) and the eight quant bytes are 4-byte aligned. Of the twelve scale bytes
+    // only the sub-block's own are loaded (get_scale_min_k4: bytes sub and sub + 4 below
+    // sub-block 4, bytes sub + 4, sub - 4 and sub from it), as bytes, so the conversion does
+    // not select words by a per-lane index.
+    const uint8_t *blk = (const uint8_t *)vx + ib * (int64_t)sizeof(block_q4_K);
     const int sub = part / 4;
-    const uint2 qq = *(const uint2 *)((const uint8_t *)(b + 4) + 32 * (sub / 2) + 8 * (part % 4));
-    r.w[0] = b[0];
-    r.w[1] = b[1];
-    r.w[2] = b[2];
-    r.w[3] = b[3];
+    const uint8_t *scales = blk + 4;
+    const uint2 qq = *(const uint2 *)(blk + 16 + 32 * (sub / 2) + 8 * (part % 4));
+    r.w[0] = *(const uint32_t *)blk;
+    r.w[1] = scales[sub < 4 ? sub : sub + 4];
+    r.w[2] = scales[sub < 4 ? sub + 4 : sub - 4];
+    r.w[3] = scales[sub];
     r.w[4] = qq.x;
     r.w[5] = qq.y;
 }
 
 static __device__ __forceinline__ void moe_conv8_q4_K(const moe_raw8 &r, int part, float *out) {
     const int sub = part / 4;
-    // get_scale_min_k4 over the scale bytes held in w[1..3].
-    const auto q = [&](int i) -> uint32_t { return (r.w[1 + i / 4] >> (8 * (i % 4))) & 0xFF; };
-    uint32_t sc, m;
-    if (sub < 4) {
-        sc = q(sub) & 63;
-        m = q(sub + 4) & 63;
-    } else {
-        sc = (q(sub + 4) & 0xF) | ((q(sub - 4) >> 6) << 4);
-        m = (q(sub + 4) >> 4) | ((q(sub) >> 6) << 4);
-    }
+    const uint32_t b0 = r.w[1], b1 = r.w[2], b2 = r.w[3];
+    const uint32_t sc = sub < 4 ? (b0 & 63) : ((b0 & 0xF) | ((b1 >> 6) << 4));
+    const uint32_t m = sub < 4 ? (b1 & 63) : ((b0 >> 4) | ((b2 >> 6) << 4));
     const float d = __half2float(__ushort_as_half((uint16_t)r.w[0])) * sc;
     const float dmin = __half2float(__ushort_as_half((uint16_t)(r.w[0] >> 16))) * m;
     const int shift = 4 * (sub & 1);

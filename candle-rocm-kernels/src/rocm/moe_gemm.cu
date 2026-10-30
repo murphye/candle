@@ -120,17 +120,28 @@ static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict_
     const int tid = threadIdx.x;
     const int wave = tid / 32;
 
-    // The output tile reuses the operand tiles' LDS once the K loop is done.
+    // The output tile reuses the operand tiles' LDS once the K loop is done, in as many
+    // passes over the rows as it takes to fit, so the operands alone size the LDS footprint
+    // (and with it the workgroups per WGP).
     constexpr int OPERAND_BYTES = (MOE_BM + MOE_BN) * MOE_LDS_K * sizeof(bfloat16_t);
     constexpr int OUTPUT_BYTES = MOE_BM * MOE_BN * sizeof(float);
-    __shared__ __align__(16) char lds[OPERAND_BYTES > OUTPUT_BYTES ? OPERAND_BYTES : OUTPUT_BYTES];
+    constexpr int OUTPUT_PASSES = (OUTPUT_BYTES + OPERAND_BYTES - 1) / OPERAND_BYTES;
+    constexpr int PASS_ROWS = MOE_BM / OUTPUT_PASSES;
+    static_assert(PASS_ROWS % 32 == 0 && PASS_ROWS * OUTPUT_PASSES == MOE_BM, "output passes cover whole waves");
+    static_assert(PASS_ROWS * MOE_BN * (int)sizeof(float) <= OPERAND_BYTES, "an output pass fits the operand LDS");
+    __shared__ __align__(16) char lds[OPERAND_BYTES];
     bfloat16_t *a_lds = (bfloat16_t *)lds;
     bfloat16_t *b_lds = a_lds + MOE_BM * MOE_LDS_K;
     float *c_lds = (float *)lds;
     __shared__ uint32_t pair_of[MOE_BM];
+    // x's row for every tile row, resolved once: `pair / topk` in the K loop was a software
+    // division per load.
+    __shared__ uint32_t xrow_of[MOE_BM];
 
     if (tid < MOE_BM) {
-        pair_of[tid] = tid < rows ? sorted[row0 + tid] : 0;
+        const uint32_t pair = tid < rows ? sorted[row0 + tid] : 0;
+        pair_of[tid] = pair;
+        xrow_of[tid] = x_per_pair ? pair : pair / topk;
     }
     __syncthreads();
 
@@ -139,6 +150,7 @@ static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict_
     constexpr int WAVES_M = MOE_BM / 32;
     constexpr int WAVES_N = (MOE_THREADS / 32) / WAVES_M;
     constexpr int FN = MOE_BN / WAVES_N / 16;
+    static_assert(FN * WAVES_N * 16 == MOE_BN, "the N tile divides over the waves");
     const int wave_m = wave / WAVES_N;
     const int wave_n = wave % WAVES_N;
     const bool wave_active = wave_m * 32 < rows;
@@ -169,9 +181,7 @@ static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict_
             const int c = (g % (MOE_BK / 8)) * 8;
             uint4 packed = make_uint4(0, 0, 0, 0);
             if (r < rows) {
-                const uint32_t pair = pair_of[r];
-                const int64_t xrow = x_per_pair ? pair : pair / topk;
-                const T *src = x + xrow * k + k0 + c;
+                const T *src = x + (int64_t)xrow_of[r] * k + k0 + c;
                 if constexpr (sizeof(T) == 2 && std::is_same<T, __nv_bfloat16>::value) {
                     packed = *(const uint4 *)src;
                 } else {
@@ -278,25 +288,35 @@ static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict_
         }
     }
 #pragma unroll
-    for (int i = 0; i < 2; ++i) {
+    for (int pass = 0; pass < OUTPUT_PASSES; ++pass) {
+        const int pass_row0 = pass * PASS_ROWS;
+        if (wave_m * 32 >= pass_row0 && wave_m * 32 < pass_row0 + PASS_ROWS) {
 #pragma unroll
-        for (int j = 0; j < FN; ++j) {
-            store_matrix_sync(c_lds + (wave_m * 32 + i * 16) * MOE_BN + (wave_n * FN + j) * 16, acc[i][j],
-                              MOE_BN, mem_row_major);
+            for (int i = 0; i < 2; ++i) {
+#pragma unroll
+                for (int j = 0; j < FN; ++j) {
+                    store_matrix_sync(c_lds + (wave_m * 32 - pass_row0 + i * 16) * MOE_BN + (wave_n * FN + j) * 16,
+                                      acc[i][j], MOE_BN, mem_row_major);
+                }
+            }
         }
-    }
-    __syncthreads();
-    for (int e = tid; e < MOE_BM * MOE_BN; e += MOE_THREADS) {
-        const int r = e / MOE_BN;
-        const int c = e % MOE_BN;
-        if (r < rows && n0 + c < n) {
-            y[(int64_t)pair_of[r] * n + n0 + c] = moe_from_float<T>(c_lds[e]);
+        __syncthreads();
+        for (int e = tid; e < PASS_ROWS * MOE_BN; e += MOE_THREADS) {
+            const int r = pass_row0 + e / MOE_BN;
+            const int c = e % MOE_BN;
+            if (r < rows && n0 + c < n) {
+                y[(int64_t)pair_of[r] * n + n0 + c] = moe_from_float<T>(c_lds[e]);
+            }
         }
+        __syncthreads();
     }
 #endif
 }
 
-// `wide` (32 x 128 tiles) suits few rows per expert, `tall` (128 x 64) many.
+// `wide` (32 x 128 tiles) suits few rows per expert, `tall` (128 x 64) many. (A 128 x 160
+// tile, reading x 2.5x less often with five MMAs per A fragment, measured no faster: the
+// kernel is not bound by LDS reads once the per-load division and the scale-word selects
+// are gone, and the wider tile costs occupancy.)
 #define MOE_GEMM(TAG, QK, BLOCK, LOAD, CONV, T, DST)                                                              \
     extern "C" __global__ void moe_gemm_##TAG##_##DST##_wide(                                              \
         const void *w, const T *x, T *y, const uint32_t *sorted, const uint32_t *offsets,                 \
