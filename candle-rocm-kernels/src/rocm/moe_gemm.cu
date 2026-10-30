@@ -83,6 +83,17 @@ template <> __device__ __forceinline__ __nv_bfloat16 moe_from_float<__nv_bfloat1
 }
 
 // y[pair, n] = x[row(pair), :] . w[expert(pair), n, :] for every routed pair.
+// f32 -> bf16 bits, round to nearest even. gfx12 has no conversion instruction and
+// __float2bfloat16 compiles to a NaN check under exec-mask juggling plus six rounding ops per
+// value; dequantized weights are finite, so the rounding alone will do (three VALU ops).
+static __device__ __forceinline__ uint32_t moe_bf16_bits(float f) {
+    const uint32_t u = __float_as_uint(f);
+    return (u + 0x7fffu + ((u >> 16) & 1u)) >> 16;
+}
+static __device__ __forceinline__ uint32_t moe_bf16x2_bits(float lo, float hi) {
+    return moe_bf16_bits(lo) | (moe_bf16_bits(hi) << 16);
+}
+
 // A workgroup barrier that publishes LDS writes only. `__syncthreads()` also waits for every
 // outstanding global load, which would make the K loop's prefetch of the next step wait at
 // each barrier; this leaves those loads in flight.
@@ -221,21 +232,14 @@ static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict_
             const int g = tid + i * MOE_THREADS;
             const int nn = g / (MOE_BK / 8);
             const int c = (g % (MOE_BK / 8)) * 8;
-            __align__(16) bfloat16_t v[8];
+            uint4 packed = make_uint4(0u, 0u, 0u, 0u);
             if (n0 + nn < n) {
                 float f[8];
                 conv8(b_reg[i], ((k0 + c) % QK) / 8, f);
-#pragma unroll
-                for (int l = 0; l < 8; ++l) {
-                    v[l] = static_cast<bfloat16_t>(f[l]);
-                }
-            } else {
-#pragma unroll
-                for (int l = 0; l < 8; ++l) {
-                    v[l] = static_cast<bfloat16_t>(0.0f);
-                }
+                packed = make_uint4(moe_bf16x2_bits(f[0], f[1]), moe_bf16x2_bits(f[2], f[3]),
+                                    moe_bf16x2_bits(f[4], f[5]), moe_bf16x2_bits(f[6], f[7]));
             }
-            *(uint4 *)(b_lds + nn * MOE_LDS_K + c) = *(const uint4 *)v;
+            *(uint4 *)(b_lds + nn * MOE_LDS_K + c) = packed;
         }
     };
 

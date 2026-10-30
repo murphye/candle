@@ -635,15 +635,15 @@ fn moe_gemm_probe(dev: &RocmDevice, probe: &'static str) -> Result<bool> {
 }
 
 /// Whether the grouped MoE GEMM multiplies int8-quantized activations on the int8 WMMA for
-/// this weight type. Q8_0 weights go straight to the tile (22% faster than dequantizing to
-/// bf16 on gfx1201); Q4_K's per-sub-block scale and min cost as much VALU to apply per tile
-/// as the bf16 conversion they replace, so it stays on the bf16 path unless
-/// `CANDLE_ROCM_MOE_INT8=all` (`0` disables the int8 path entirely).
+/// this weight type. Off by default: once the bf16 tile's f32 -> bf16 rounding stopped going
+/// through `__float2bfloat16` (a branchy NaN check per weight on gfx1201), the bf16 path
+/// beat the int8 tile for Q8_0 as well (0.89 vs 1.06 ms for the Flash Next down projection at
+/// 2048 tokens). `CANDLE_ROCM_MOE_INT8=q8` keeps the int8 tile for Q8_0, `all` adds Q4_K.
 fn moe_gemm_int8_enabled(dtype: GgmlDType) -> bool {
     match std::env::var("CANDLE_ROCM_MOE_INT8").as_deref() {
-        Ok("0") => false,
+        Ok("q8") => dtype == GgmlDType::Q8_0,
         Ok("all") => matches!(dtype, GgmlDType::Q4K | GgmlDType::Q8_0),
-        _ => dtype == GgmlDType::Q8_0,
+        _ => false,
     }
 }
 
