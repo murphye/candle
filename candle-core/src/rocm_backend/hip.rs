@@ -284,23 +284,39 @@ impl Staging {
 /// `hipMallocAsync` of large blocks can take milliseconds even when the pool
 /// holds enough free memory (the grouped MoE path reuses ~1 GB per layer).
 const CACHE_MAX_BLOCK_BYTES: usize = 1536 << 20;
-/// Upper bound on the bytes held by the cache of one stream.
 /// Default bound on the freed blocks a stream keeps for reuse. Prefill temporaries of many
-/// distinct sizes fill the cache quickly, and whatever it holds is memory the device's pool
-/// cannot hand to a live allocation: engines sizing a KV cache against free memory must
-/// account for it. `CANDLE_ROCM_BLOCK_CACHE_MB` overrides it.
-const CACHE_MAX_TOTAL_BYTES_DEFAULT: usize = 512 << 20;
+/// distinct sizes fill the cache quickly, and a block the cache cannot take goes back through
+/// `hipFreeAsync`, one in ten of which took 1-70 ms on ROCm 7 (the host thread then falls
+/// behind the device). Whatever the cache holds is memory the device's pool cannot hand to a
+/// live allocation: engines sizing a KV cache against free memory must account for it, and
+/// may lower it with [`set_block_cache_max_bytes`]. `CANDLE_ROCM_BLOCK_CACHE_MB` overrides it.
+const CACHE_MAX_TOTAL_BYTES_DEFAULT: usize = 2048 << 20;
+
+static BLOCK_CACHE_MAX_BYTES: std::sync::OnceLock<std::sync::atomic::AtomicUsize> =
+    std::sync::OnceLock::new();
+
+fn block_cache_max_bytes_cell() -> &'static std::sync::atomic::AtomicUsize {
+    BLOCK_CACHE_MAX_BYTES.get_or_init(|| {
+        std::sync::atomic::AtomicUsize::new(
+            std::env::var("CANDLE_ROCM_BLOCK_CACHE_MB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(|mb| mb << 20)
+                .unwrap_or(CACHE_MAX_TOTAL_BYTES_DEFAULT),
+        )
+    })
+}
 
 /// The block cache bound in bytes (see `CACHE_MAX_TOTAL_BYTES_DEFAULT`).
 pub fn block_cache_max_bytes() -> usize {
-    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *BYTES.get_or_init(|| {
-        std::env::var("CANDLE_ROCM_BLOCK_CACHE_MB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .map(|mb| mb << 20)
-            .unwrap_or(CACHE_MAX_TOTAL_BYTES_DEFAULT)
-    })
+    block_cache_max_bytes_cell().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sets the block cache bound for every stream from now on; blocks already cached beyond a
+/// lower bound stay until released. For engines that trade the cache against memory they
+/// need for a KV cache.
+pub fn set_block_cache_max_bytes(bytes: usize) {
+    block_cache_max_bytes_cell().store(bytes, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The bytes actually allocated for a request: 512 byte granularity for small

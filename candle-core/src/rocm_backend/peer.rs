@@ -243,6 +243,57 @@ impl PeerAllReduce {
         self.exchange(xs, "peer_allgather_bf16", self.world)
     }
 
+    /// The first half of a wide all-reduce on its own: pushes `xs` into every peer's receive
+    /// slot for this rank and publishes the epoch, for a kernel that reads the peers' partials
+    /// itself (the receive-buffer layout is described in `peer_allreduce.cu`). That kernel must
+    /// wait for the peers' epochs and advance the epoch from its last workgroup, as
+    /// `peer_allreduce_bf16_wide` does. `xs` must satisfy [`Self::supports`].
+    pub fn push_wide(&self, xs: &Tensor) -> Result<()> {
+        if !self.supports(xs) {
+            crate::bail!("peer push does not take {:?} {:?}", xs.dtype(), xs.shape());
+        }
+        let xs = xs.contiguous()?;
+        let n = xs.elem_count();
+        let (guard, layout) = xs.storage_and_layout();
+        let Storage::Rocm(storage) = &*guard else {
+            crate::bail!("peer push needs a rocm tensor");
+        };
+        let x = storage
+            .as_rocm_slice::<half::bf16>()?
+            .slice(layout.start_offset()..)
+            .device_ptr();
+        if x % 16 != 0 {
+            crate::bail!("peer push needs 16-byte aligned input");
+        }
+        let (n, max_elems, rank, world) = (
+            n as i32,
+            self.max_elems as i32,
+            self.rank as i32,
+            self.world as i32,
+        );
+        let vectors = (n as usize).div_ceil(8);
+        let cfg = LaunchConfig {
+            grid_dim: (vectors.div_ceil(WIDE_BLOCK).clamp(1, WIDE_MAX_BLOCKS) as u32, 1, 1),
+            block_dim: (WIDE_BLOCK as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let push = self
+            .device
+            .get_or_load_func("peer_push_bf16_wide", &kernels::PEER_ALLREDUCE)?;
+        let mut builder = push.builder();
+        builder.arg(&x);
+        builder.arg(&n);
+        builder.arg(&max_elems);
+        builder.arg(&self.peers);
+        builder.arg(&rank);
+        builder.arg(&world);
+        builder.arg(&self.epoch);
+        builder.arg(&self.counters);
+        // SAFETY: ffi; the peers' buffers hold `max_elems` elements per slot and n <= max_elems.
+        unsafe { builder.launch(cfg) }.w()?;
+        Ok(())
+    }
+
     /// Runs `kernel` over `xs`; its output holds `out_mult` copies of `xs`' shape.
     fn exchange(&self, xs: &Tensor, kernel: &str, out_mult: usize) -> Result<Tensor> {
         if !self.supports(xs) {
