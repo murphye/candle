@@ -20,6 +20,11 @@ fn main() -> Result<()> {
         ("shexp up", 640, 2560, GgmlDType::Q4K),
         ("shexp down", 2560, 640, GgmlDType::Q8_0),
         ("lm head/2", 124160, 2560, GgmlDType::Q6K),
+        // Few-row weights (k > 8 * rows): the split-K kernels at verify widths.
+        ("hc gate", 4, 10240, GgmlDType::Q8_0),
+        ("gdn ab", 24, 2560, GgmlDType::Q4K),
+        ("small 256", 256, 2560, GgmlDType::Q6K),
+        ("hc 320", 320, 10240, GgmlDType::Q4K),
     ] {
       for &rows in &batches {
         let w = Tensor::randn(0f32, 1.0, (n, k), &device)?;

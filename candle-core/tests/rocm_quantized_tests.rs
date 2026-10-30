@@ -44,6 +44,69 @@ fn quantized_matmul_matches_cpu() -> Result<()> {
     Ok(())
 }
 
+/// Weights with fewer than k / 8 rows (routers, gates, small projections) at the padded widths of a
+/// speculative verify step take the split-K kernels.
+#[test]
+fn few_row_weights_at_verify_widths_match_cpu() -> Result<()> {
+    let rocm = Device::new_rocm(0)?;
+    for (n, k) in [(1usize, 2560usize), (24, 2560), (40, 1024)] {
+        let w = Tensor::randn(0f32, 1.0, (n, k), &Device::Cpu)?;
+        for dtype in [
+            GgmlDType::Q4_0,
+            GgmlDType::Q5_0,
+            GgmlDType::Q8_0,
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+        ] {
+            let cpu = QMatMul::from_qtensor(QTensor::quantize(&w, dtype)?)?;
+            let gpu = QMatMul::from_qtensor(QTensor::quantize(&w.to_device(&rocm)?, dtype)?)?;
+            for m in [9usize, 12, 13, 16, 24, 32] {
+                for act in [DType::BF16, DType::F32] {
+                    let x = Tensor::randn(0f32, 1.0, (1, m, k), &Device::Cpu)?.to_dtype(act)?;
+                    let expected = cpu.forward(&x.to_dtype(DType::F32)?)?;
+                    let got = gpu.forward(&x.to_device(&rocm)?)?;
+                    assert_eq!(got.dims(), &[1, m, n]);
+                    let diff = max_rel_diff(&expected, &got)?;
+                    assert!(diff < 0.05, "{dtype:?} n={n} k={k} m={m} {act:?}: relative diff {diff}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Padded verify widths (zero-padded to 12, 16, 24 or 32 columns) on weights of the trunk's
+/// geometry: K of 2560 and 3072, and odd and even row counts, which pick Q4_K's one- and
+/// two-rows-per-wave kernels where those apply.
+#[test]
+fn verify_widths_on_trunk_shapes_match_cpu() -> Result<()> {
+    let rocm = Device::new_rocm(0)?;
+    for (n, k) in [(321usize, 2560usize), (322, 2560), (520, 3072)] {
+        let w = Tensor::randn(0f32, 1.0, (n, k), &Device::Cpu)?;
+        for dtype in [
+            GgmlDType::Q4_0,
+            GgmlDType::Q5_0,
+            GgmlDType::Q8_0,
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+        ] {
+            let cpu = QMatMul::from_qtensor(QTensor::quantize(&w, dtype)?)?;
+            let gpu = QMatMul::from_qtensor(QTensor::quantize(&w.to_device(&rocm)?, dtype)?)?;
+            for m in [9usize, 12, 16, 17, 24, 32] {
+                let x = Tensor::randn(0f32, 1.0, (1, m, k), &Device::Cpu)?.to_dtype(DType::BF16)?;
+                let expected = cpu.forward(&x.to_dtype(DType::F32)?)?;
+                let got = gpu.forward(&x.to_device(&rocm)?)?;
+                assert_eq!(got.dims(), &[1, m, n]);
+                let diff = max_rel_diff(&expected, &got)?;
+                assert!(diff < 0.05, "{dtype:?} n={n} k={k} m={m}: relative diff {diff}");
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn indexed_moe_forward_matches_cpu() -> Result<()> {
     // Few pairs use the fused kernel; many pairs use the grouped dequantize + GEMM path.

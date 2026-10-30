@@ -1272,6 +1272,7 @@ impl QRocmStorage {
             && dequantize_kernel_available(self.dtype)
             && !FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed)
         {
+            log_dequantize_gemm_shape(self.dtype, self_shape, rows);
             return self.dequantize_gemm(self_shape, storage, layout, in_dtype);
         }
 
@@ -1321,6 +1322,31 @@ const MMVQ_MAX_ROWS: usize = 8;
 /// beyond the last, the weights are dequantized for a dense GEMM.
 const MMVQ_PADDED_ROWS: [usize; 4] = [12, 16, 24, 32];
 const MMVQ_PADDED_MAX_ROWS: usize = 32;
+/// Waves per row in the split-K kernels (`MMVQ_SPLITK_WAVES` in mmvq_rocm.cu).
+const MMVQ_SPLITK_WAVES: u32 = 4;
+
+/// `CANDLE_ROCM_MMVQ_SPLITK=0` sends padded batches on few-row weights back to dequantize + GEMM.
+fn mmvq_splitk_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CANDLE_ROCM_MMVQ_SPLITK").map_or(true, |v| v != "0"))
+}
+
+/// With `CANDLE_ROCM_LOG_DEQUANT_GEMM` set, print each (dtype, weight shape, rows) that falls
+/// back to dequantize + dense GEMM, once: the shapes a missing vector kernel would cover.
+fn log_dequantize_gemm_shape(dtype: GgmlDType, shape: &crate::Shape, rows: usize) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("CANDLE_ROCM_LOG_DEQUANT_GEMM").is_some()) {
+        return;
+    }
+    static SEEN: std::sync::Mutex<Vec<(GgmlDType, Vec<usize>, usize)>> =
+        std::sync::Mutex::new(Vec::new());
+    let key = (dtype, shape.dims().to_vec(), rows);
+    let mut seen = SEEN.lock().unwrap();
+    if !seen.contains(&key) {
+        eprintln!("CANDLE_ROCM_DEQUANT_GEMM {dtype:?} weight {:?} rows {rows}", shape.dims());
+        seen.push(key);
+    }
+}
 
 fn dequantize_kernel_available(dtype: GgmlDType) -> bool {
     matches!(
@@ -1619,9 +1645,13 @@ impl QRocmStorage {
                 .find(|&&rows| rows >= b_size)
                 .expect("b_size <= MMVQ_PADDED_MAX_ROWS")
         };
-        // The padded widths exist for the row-per-wave kernels only (weights with at least
-        // k / 8 rows); the rest keep the dequantized GEMM.
-        if b_size > MMVQ_MAX_ROWS && k > 8 * nrows {
+        // Weights with fewer than k / 8 rows get a block of waves per row splitting K at the
+        // padded widths; one wave per row would leave the GPU mostly idle. Measured against the
+        // dequantized GEMM it wins at twelve columns for every such weight, and at sixteen and
+        // more only for the tiny ones (gates of a few dozen rows); the 256- and 320-row weights
+        // are faster through the GEMM there.
+        let splitk = b_size > MMVQ_MAX_ROWS && k > 8 * nrows;
+        if splitk && (!mmvq_splitk_enabled() || (b_launch > 12 && nrows > 64)) {
             return Ok(None);
         }
         let mut padded: Option<S> = None;
@@ -1678,6 +1708,37 @@ impl QRocmStorage {
             S::F32(s) => s.device_ptr(),
             _ => unreachable!(),
         };
+        if splitk {
+            let cfg = LaunchConfig {
+                grid_dim: (nrows as u32, 1, 1),
+                block_dim: (WARP_SIZE as u32, MMVQ_SPLITK_WAVES, 1),
+                shared_mem_bytes: 0,
+            };
+            let func = dev.get_or_load_func_keyed(
+                (tag, dst_tag, "splitk"),
+                b_size,
+                &kernels::MMVQ,
+                || format!("mmvq_gguf_{tag}_{dst_tag}_splitk{b_size}"),
+            )?;
+            let stride_col_y = (k_padded / GgmlDType::Q8_1.block_size()) as i32;
+            let mut builder = func.builder();
+            builder.arg(weights);
+            builder.arg(&y_q8_1);
+            builder.arg(&out_ptr);
+            barg!(builder, k as i32, nrows as i32, stride_col_y);
+            unsafe { builder.launch(cfg) }.w()?;
+            keep_q8_1();
+            let mut out_shape = rhs_l.shape().dims().to_vec();
+            out_shape.pop();
+            out_shape.push(nrows);
+            return Ok(Some((
+                RocmStorage {
+                    slice: out,
+                    device: dev.clone(),
+                },
+                out_shape.into(),
+            )));
+        }
         // A single token gives each row its own warp unless there are too few rows
         // to fill the GPU, where splitting long rows across warps wins.
         if b_size == 1 && k <= 8 * nrows {
