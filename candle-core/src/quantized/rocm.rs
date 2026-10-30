@@ -603,15 +603,24 @@ fn indexed_moe_tag(dtype: GgmlDType) -> Option<&'static str> {
 
 /// Whether `dev`'s code object carries the WMMA grouped MoE kernels (gfx11 and gfx12).
 fn moe_gemm_available(dev: &RocmDevice) -> Result<bool> {
+    moe_gemm_probe(dev, "moe_gemm_available")
+}
+
+/// Whether `dev`'s code object carries the int8 WMMA grouped MoE kernels (gfx12).
+fn moe_gemm_i8_available(dev: &RocmDevice) -> Result<bool> {
+    moe_gemm_probe(dev, "moe_gemm_i8_available")
+}
+
+fn moe_gemm_probe(dev: &RocmDevice, probe: &'static str) -> Result<bool> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    static AVAILABLE: OnceLock<Mutex<HashMap<usize, bool>>> = OnceLock::new();
+    static AVAILABLE: OnceLock<Mutex<HashMap<(usize, &'static str), bool>>> = OnceLock::new();
     let cache = AVAILABLE.get_or_init(Default::default);
-    if let Some(&known) = cache.lock().unwrap().get(&dev.ordinal()) {
+    if let Some(&known) = cache.lock().unwrap().get(&(dev.ordinal(), probe)) {
         return Ok(known);
     }
     let flag = dev.alloc_zeros::<i32>(1)?;
-    let func = dev.get_or_load_func("moe_gemm_available", &kernels::MOE_GEMM)?;
+    let func = dev.get_or_load_func(probe, &kernels::MOE_GEMM)?;
     let mut builder = func.builder();
     builder.arg(&flag);
     let cfg = LaunchConfig {
@@ -621,8 +630,21 @@ fn moe_gemm_available(dev: &RocmDevice) -> Result<bool> {
     };
     unsafe { builder.launch(cfg) }.w()?;
     let known = dev.clone_dtoh(&flag)?[0] == 1;
-    cache.lock().unwrap().insert(dev.ordinal(), known);
+    cache.lock().unwrap().insert((dev.ordinal(), probe), known);
     Ok(known)
+}
+
+/// Whether the grouped MoE GEMM multiplies int8-quantized activations on the int8 WMMA for
+/// this weight type. Q8_0 weights go straight to the tile (22% faster than dequantizing to
+/// bf16 on gfx1201); Q4_K's per-sub-block scale and min cost as much VALU to apply per tile
+/// as the bf16 conversion they replace, so it stays on the bf16 path unless
+/// `CANDLE_ROCM_MOE_INT8=all` (`0` disables the int8 path entirely).
+fn moe_gemm_int8_enabled(dtype: GgmlDType) -> bool {
+    match std::env::var("CANDLE_ROCM_MOE_INT8").as_deref() {
+        Ok("0") => false,
+        Ok("all") => matches!(dtype, GgmlDType::Q4K | GgmlDType::Q8_0),
+        _ => dtype == GgmlDType::Q8_0,
+    }
 }
 
 impl QRocmStorage {
@@ -752,23 +774,56 @@ impl QRocmStorage {
             S::F32(s) => s.device_ptr(),
             _ => unreachable!(),
         };
-        let func =
-            dev.get_or_load_func(&format!("moe_gemm_{tag}_{dst_tag}_{shape}"), &kernels::MOE_GEMM)?;
-        let mut builder = func.builder();
-        builder.arg(&self.data.inner);
-        builder.arg(&x_ptr);
-        builder.arg(&out_ptr);
-        builder.arg(&sorted);
-        builder.arg(&offsets);
-        builder.arg(&tiles);
-        builder.arg(&n_tiles);
-        barg!(builder, n as i32, k as i32, topk as i32, (input_dim1 != 1) as i32);
         let cfg = LaunchConfig {
             grid_dim: (n.div_ceil(bn) as u32, max_tiles as u32, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { builder.launch(cfg) }.w()?;
+        let int8 = k % 32 == 0 && moe_gemm_int8_enabled(self.dtype()) && moe_gemm_i8_available(dev)?;
+        if int8 {
+            // The activation rows quantized to int8 per 32-element block, with {d, d * sum(q)}.
+            let x_rows = batch * input_dim1;
+            let xq = unsafe { dev.alloc::<u8>(x_rows * k)? };
+            let xm = unsafe { dev.alloc::<f32>(x_rows * (k / 32) * 2)? };
+            let quant = dev.get_or_load_func(&format!("moe_quant_x_q8_{dst_tag}"), &kernels::MOE_GEMM)?;
+            let mut builder = quant.builder();
+            builder.arg(&x_ptr);
+            builder.arg(&xq);
+            builder.arg(&xm);
+            barg!(builder, k as i32);
+            let qcfg = LaunchConfig {
+                grid_dim: (x_rows as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { builder.launch(qcfg) }.w()?;
+            let func = dev
+                .get_or_load_func(&format!("moe_gemm_i8_{tag}_{dst_tag}_{shape}"), &kernels::MOE_GEMM)?;
+            let mut builder = func.builder();
+            builder.arg(&self.data.inner);
+            builder.arg(&xq);
+            builder.arg(&xm);
+            builder.arg(&out_ptr);
+            builder.arg(&sorted);
+            builder.arg(&offsets);
+            builder.arg(&tiles);
+            builder.arg(&n_tiles);
+            barg!(builder, n as i32, k as i32, topk as i32, (input_dim1 != 1) as i32);
+            unsafe { builder.launch(cfg) }.w()?;
+        } else {
+            let func =
+                dev.get_or_load_func(&format!("moe_gemm_{tag}_{dst_tag}_{shape}"), &kernels::MOE_GEMM)?;
+            let mut builder = func.builder();
+            builder.arg(&self.data.inner);
+            builder.arg(&x_ptr);
+            builder.arg(&out_ptr);
+            builder.arg(&sorted);
+            builder.arg(&offsets);
+            builder.arg(&tiles);
+            builder.arg(&n_tiles);
+            barg!(builder, n as i32, k as i32, topk as i32, (input_dim1 != 1) as i32);
+            unsafe { builder.launch(cfg) }.w()?;
+        }
         Ok(Some((
             RocmStorage {
                 slice: out,
