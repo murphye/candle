@@ -140,34 +140,46 @@ static __device__ __forceinline__ void moe_dequant8_q4_K(const void *vx, int64_t
 }
 
 static __device__ __forceinline__ void moe_load8_q4_K(const void *vx, int64_t ib, int part, moe_raw8 &r) {
-    // dm (4 bytes) and the eight quant bytes are 4-byte aligned. Of the twelve scale bytes
-    // only the sub-block's own are loaded (get_scale_min_k4: bytes sub and sub + 4 below
-    // sub-block 4, bytes sub + 4, sub - 4 and sub from it), as bytes, so the conversion does
-    // not select words by a per-lane index.
+    // The 16-byte head (dm and the twelve scale bytes) and the eight quant bytes, two loads.
+    // The conversion picks its sub-block's scale bytes out of the head words by a shift, so
+    // the per-lane sub-block index never selects a word.
     const uint8_t *blk = (const uint8_t *)vx + ib * (int64_t)sizeof(block_q4_K);
     const int sub = part / 4;
-    const uint8_t *scales = blk + 4;
+    const uint4 head = *(const uint4 *)blk;
     const uint2 qq = *(const uint2 *)(blk + 16 + 32 * (sub / 2) + 8 * (part % 4));
-    r.w[0] = *(const uint32_t *)blk;
-    r.w[1] = scales[sub < 4 ? sub : sub + 4];
-    r.w[2] = scales[sub < 4 ? sub + 4 : sub - 4];
-    r.w[3] = scales[sub];
+    r.w[0] = head.x;
+    r.w[1] = head.y;
+    r.w[2] = head.z;
+    r.w[3] = head.w;
     r.w[4] = qq.x;
     r.w[5] = qq.y;
 }
 
+// The sub-block's 6-bit scale and min from the three scale words of a Q4_K head
+// (get_scale_min_k4). Byte `sub & 3` of each word is shifted into the low byte, so the
+// per-lane sub-block index never selects a word.
+static __device__ __forceinline__ void moe_q4_K_scale_min(const moe_raw8 &r, int sub, uint32_t &sc, uint32_t &m) {
+    const int bsh = 8 * (sub & 3);
+    const uint32_t s0 = r.w[1] >> bsh, s1 = r.w[2] >> bsh, s2 = r.w[3] >> bsh;
+    sc = sub < 4 ? (s0 & 63) : ((s2 & 0xF) | (((s0 >> 6) & 3) << 4));
+    m = sub < 4 ? (s1 & 63) : (((s2 >> 4) & 0xF) | (((s1 >> 6) & 3) << 4));
+}
+
 static __device__ __forceinline__ void moe_conv8_q4_K(const moe_raw8 &r, int part, float *out) {
     const int sub = part / 4;
-    const uint32_t b0 = r.w[1], b1 = r.w[2], b2 = r.w[3];
-    const uint32_t sc = sub < 4 ? (b0 & 63) : ((b0 & 0xF) | ((b1 >> 6) << 4));
-    const uint32_t m = sub < 4 ? (b1 & 63) : ((b0 >> 4) | ((b2 >> 6) << 4));
+    uint32_t sc, m;
+    moe_q4_K_scale_min(r, sub, sc, m);
     const float d = __half2float(__ushort_as_half((uint16_t)r.w[0])) * sc;
     const float dmin = __half2float(__ushort_as_half((uint16_t)(r.w[0] >> 16))) * m;
+    // One shift and mask per quant word leaves each weight in its own byte, which the
+    // byte-to-float conversions take directly.
     const int shift = 4 * (sub & 1);
+    const uint32_t q0 = (r.w[4] >> shift) & 0x0F0F0F0Fu;
+    const uint32_t q1 = (r.w[5] >> shift) & 0x0F0F0F0Fu;
 #pragma unroll
     for (int l = 0; l < 8; ++l) {
-        const uint32_t word = l < 4 ? r.w[4] : r.w[5];
-        out[l] = d * ((word >> (8 * (l % 4) + shift)) & 0x0F) - dmin;
+        const uint32_t word = l < 4 ? q0 : q1;
+        out[l] = d * (float)((word >> (8 * (l % 4))) & 0xFFu) - dmin;
     }
 }
 

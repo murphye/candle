@@ -83,15 +83,15 @@ template <> __device__ __forceinline__ __nv_bfloat16 moe_from_float<__nv_bfloat1
 }
 
 // y[pair, n] = x[row(pair), :] . w[expert(pair), n, :] for every routed pair.
-// f32 -> bf16 bits, round to nearest even. gfx12 has no conversion instruction and
-// __float2bfloat16 compiles to a NaN check under exec-mask juggling plus six rounding ops per
-// value; dequantized weights are finite, so the rounding alone will do (three VALU ops).
-static __device__ __forceinline__ uint32_t moe_bf16_bits(float f) {
-    const uint32_t u = __float_as_uint(f);
-    return (u + 0x7fffu + ((u >> 16) & 1u)) >> 16;
-}
+// Two f32 -> bf16, round half up: gfx12 has no conversion instruction and __float2bfloat16
+// compiles to a NaN check under exec-mask juggling plus six rounding ops per value. The
+// weights are finite, and a tie is a 2^-16 event on a dequantized product, so one add per
+// value and a byte permute that packs the two upper halves do (1.5 VALU per weight).
 static __device__ __forceinline__ uint32_t moe_bf16x2_bits(float lo, float hi) {
-    return moe_bf16_bits(lo) | (moe_bf16_bits(hi) << 16);
+    const uint32_t l = __float_as_uint(lo) + 0x8000u;
+    const uint32_t h = __float_as_uint(hi) + 0x8000u;
+    // Result bytes: l.2, l.3, h.2, h.3 (selectors 0-3 pick the second operand's bytes).
+    return __builtin_amdgcn_perm(h, l, 0x07060302u);
 }
 
 // A workgroup barrier that publishes LDS writes only. `__syncthreads()` also waits for every
@@ -183,16 +183,37 @@ static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict_
     static_assert(A_GROUPS * MOE_THREADS == MOE_BM * (MOE_BK / 8), "the A tile divides over the threads");
     static_assert(B_GROUPS * MOE_THREADS == MOE_BN * (MOE_BK / 8), "the B tile divides over the threads");
 
+    // The fixed part of every group's address, resolved once: x's element offset of the
+    // row's first column of the piece, the byte offset of the weight row's first block.
+    // 32-bit offsets (an activation tensor or an expert's weights never reach 4 GB), so a
+    // step's load is the uniform base plus a 32-bit vector offset, no 64-bit multiply.
+    uint32_t a_off[A_GROUPS];
+    bool a_ok[A_GROUPS];
+#pragma unroll
+    for (int i = 0; i < A_GROUPS; ++i) {
+        const int g = tid + i * MOE_THREADS;
+        const int r = g / (MOE_BK / 8);
+        const int c = (g % (MOE_BK / 8)) * 8;
+        a_ok[i] = r < rows;
+        a_off[i] = xrow_of[r] * (uint32_t)k + (uint32_t)c;
+    }
+    uint32_t b_off[B_GROUPS];
+    bool b_ok[B_GROUPS];
+#pragma unroll
+    for (int i = 0; i < B_GROUPS; ++i) {
+        const int g = tid + i * MOE_THREADS;
+        const int nn = g / (MOE_BK / 8);
+        b_ok[i] = n0 + nn < n;
+        b_off[i] = (uint32_t)((n0 + nn) * blocks_per_row) * (uint32_t)block_bytes;
+    }
+
     // Global loads of one K step into registers.
     auto load_step = [&](const int k0, uint4 (&a_reg)[A_GROUPS], moe_raw8 (&b_reg)[B_GROUPS]) {
 #pragma unroll
         for (int i = 0; i < A_GROUPS; ++i) {
-            const int g = tid + i * MOE_THREADS;
-            const int r = g / (MOE_BK / 8);
-            const int c = (g % (MOE_BK / 8)) * 8;
             uint4 packed = make_uint4(0, 0, 0, 0);
-            if (r < rows) {
-                const T *src = x + (int64_t)xrow_of[r] * k + k0 + c;
+            if (a_ok[i]) {
+                const T *src = x + (a_off[i] + (uint32_t)k0);
                 if constexpr (sizeof(T) == 2 && std::is_same<T, __nv_bfloat16>::value) {
                     packed = *(const uint4 *)src;
                 } else {
@@ -209,12 +230,11 @@ static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict_
 #pragma unroll
         for (int i = 0; i < B_GROUPS; ++i) {
             const int g = tid + i * MOE_THREADS;
-            const int nn = g / (MOE_BK / 8);
             const int c = (g % (MOE_BK / 8)) * 8;
-            if (n0 + nn < n) {
+            if (b_ok[i]) {
                 const int kk = k0 + c;
-                const int64_t ib = (int64_t)(n0 + nn) * blocks_per_row + kk / QK;
-                load8(wexp, ib, (kk % QK) / 8, b_reg[i]);
+                const uint32_t off = b_off[i] + (uint32_t)(kk / QK) * (uint32_t)block_bytes;
+                load8(wexp + off, 0, (kk % QK) / 8, b_reg[i]);
             }
         }
     };
@@ -233,7 +253,7 @@ static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict_
             const int nn = g / (MOE_BK / 8);
             const int c = (g % (MOE_BK / 8)) * 8;
             uint4 packed = make_uint4(0u, 0u, 0u, 0u);
-            if (n0 + nn < n) {
+            if (b_ok[i]) {
                 float f[8];
                 conv8(b_reg[i], ((k0 + c) % QK) / 8, f);
                 packed = make_uint4(moe_bf16x2_bits(f[0], f[1]), moe_bf16x2_bits(f[2], f[3]),
@@ -242,19 +262,14 @@ static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict_
             *(uint4 *)(b_lds + nn * MOE_LDS_K + c) = packed;
         }
     };
-
-    uint4 a_cur[A_GROUPS];
-    moe_raw8 b_cur[B_GROUPS];
-    load_step(0, a_cur, b_cur);
-    for (int k0 = 0; k0 < k; k0 += MOE_BK) {
+    // One K step: this step's registers to LDS, the next step's loads issued after the
+    // barrier (so the wait for this step's registers does not also wait for them; they land
+    // during the MMAs), the MMAs, and the barrier that frees the LDS tiles.
+    auto k_step = [&](const int k0, const uint4 (&a_cur)[A_GROUPS], const moe_raw8 (&b_cur)[B_GROUPS],
+                      uint4 (&a_nxt)[A_GROUPS], moe_raw8 (&b_nxt)[B_GROUPS]) {
         store_step(k0, a_cur, b_cur);
         moe_lds_barrier();
-        // The next step's loads are issued after the LDS write, so the wait for this step's
-        // registers above does not also wait for them; they land during the MMAs below.
-        const bool more = k0 + MOE_BK < k;
-        uint4 a_nxt[A_GROUPS];
-        moe_raw8 b_nxt[B_GROUPS];
-        if (more) {
+        if (k0 + MOE_BK < k) {
             load_step(k0 + MOE_BK, a_nxt, b_nxt);
         }
         if (wave_active) {
@@ -280,15 +295,17 @@ static __device__ void moe_gemm(const void *__restrict__ w, const T *__restrict_
             }
         }
         moe_lds_barrier();
-        if (more) {
-#pragma unroll
-            for (int i = 0; i < A_GROUPS; ++i) {
-                a_cur[i] = a_nxt[i];
-            }
-#pragma unroll
-            for (int i = 0; i < B_GROUPS; ++i) {
-                b_cur[i] = b_nxt[i];
-            }
+    };
+
+    // Two register sets alternate between consecutive steps (the loop is unrolled by two),
+    // so no step copies the prefetched registers into place.
+    uint4 a_reg0[A_GROUPS], a_reg1[A_GROUPS];
+    moe_raw8 b_reg0[B_GROUPS], b_reg1[B_GROUPS];
+    load_step(0, a_reg0, b_reg0);
+    for (int k0 = 0; k0 < k; k0 += 2 * MOE_BK) {
+        k_step(k0, a_reg0, b_reg0, a_reg1, b_reg1);
+        if (k0 + MOE_BK < k) {
+            k_step(k0 + MOE_BK, a_reg1, b_reg1, a_reg0, b_reg0);
         }
     }
 #pragma unroll
@@ -407,9 +424,8 @@ static __device__ __forceinline__ void moe_i8_q4_K(const moe_raw8 &r, int part, 
     const int shift = 4 * (sub & 1);
     lo = (r.w[4] >> shift) & 0x0F0F0F0Fu;
     hi = (r.w[5] >> shift) & 0x0F0F0F0Fu;
-    const uint32_t b0 = r.w[1], b1 = r.w[2], b2 = r.w[3];
-    const uint32_t sc = sub < 4 ? (b0 & 63) : ((b0 & 0xF) | ((b1 >> 6) << 4));
-    const uint32_t m = sub < 4 ? (b1 & 63) : ((b0 >> 4) | ((b2 >> 6) << 4));
+    uint32_t sc, m;
+    moe_q4_K_scale_min(r, sub, sc, m);
     scale = __half2float(__ushort_as_half((uint16_t)r.w[0])) * sc;
     min = __half2float(__ushort_as_half((uint16_t)(r.w[0] >> 16))) * m;
 }
