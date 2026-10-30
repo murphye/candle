@@ -701,6 +701,7 @@ impl QRocmStorage {
             GgmlDType::Q4_0 => "q4_0",
             GgmlDType::Q5_0 => "q5_0",
             GgmlDType::Q8_0 => "q8_0",
+            GgmlDType::Q3K => "q3k",
             GgmlDType::Q4K => "q4k",
             GgmlDType::Q6K => "q6k",
             _ => return Ok(None),

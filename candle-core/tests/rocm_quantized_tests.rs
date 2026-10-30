@@ -73,6 +73,7 @@ fn indexed_moe_case(
         GgmlDType::Q5_0,
         GgmlDType::Q5_1,
         GgmlDType::Q8_0,
+        GgmlDType::Q3K,
         GgmlDType::Q4K,
         GgmlDType::Q6K,
     ] {
@@ -118,7 +119,7 @@ fn indexed_moe_glu_matches_separate_projections() -> Result<()> {
     let (num_experts, n, k, tokens, topk) = (8, 64, 512, 3, 2);
     let ids: Vec<u32> = (0..tokens * topk).map(|i| ((i * 3 + 1) % num_experts) as u32).collect();
     let ids = Tensor::from_vec(ids, (tokens, topk), &rocm)?;
-    for dtype in [GgmlDType::Q4K, GgmlDType::Q8_0, GgmlDType::Q5_0] {
+    for dtype in [GgmlDType::Q4K, GgmlDType::Q8_0, GgmlDType::Q5_0, GgmlDType::Q3K, GgmlDType::Q4_0] {
         let gate = QTensor::quantize(&Tensor::randn(0f32, 1.0, (num_experts, n, k), &rocm)?, dtype)?;
         let up = QTensor::quantize(&Tensor::randn(0f32, 1.0, (num_experts, n, k), &rocm)?, dtype)?;
         let x = Tensor::randn(0f32, 1.0, (tokens, 1, k), &rocm)?.to_dtype(DType::BF16)?;

@@ -183,6 +183,53 @@ static __device__ __forceinline__ void moe_conv8_q4_K(const moe_raw8 &r, int par
     }
 }
 
+// Q3_K: 256 weights in 110-byte blocks (2-byte aligned): hmask[32] (high bits), qs[64] (two
+// low bits), scales[12] (sixteen 6-bit scales), d. Weight w: n = w / 128, j = (w % 128) / 32,
+// l = w % 32; q = (qs[32 n + l] >> 2 j) & 3 minus 4 unless hmask[l] bit (4 n + j); scale
+// index 8 n + 2 j + (l >= 16). The eight weights of a part share n, j and the scale.
+static __device__ __forceinline__ void moe_load8_q3_K(const void *vx, int64_t ib, int part, moe_raw8 &r) {
+    const uint8_t *blk = (const uint8_t *)vx + ib * (int64_t)sizeof(block_q3_K);
+    const int n = part / 16;
+    const int j = (part % 16) / 4;
+    const int l0 = 8 * (part % 4);
+    const int is = 8 * n + 2 * j + (l0 >= 16 ? 1 : 0);
+    const uint16_t *hm = (const uint16_t *)(blk + l0);
+    const uint16_t *qs = (const uint16_t *)(blk + 32 + 32 * n + l0);
+    const uint8_t *scales = blk + 96;
+    // The two scale bytes the 6-bit scale `is` is spread over (dequantize_block_q3_K).
+    const int a = is < 8 ? is : is - 8;
+    const int b = is < 4 ? is + 8 : is < 8 ? is + 4 : is < 12 ? is : is - 4;
+    r.w[0] = *(const uint16_t *)(blk + 108);
+    r.w[1] = moe_pack16(qs);
+    r.w[2] = moe_pack16(qs + 2);
+    r.w[3] = moe_pack16(hm);
+    r.w[4] = moe_pack16(hm + 2);
+    r.w[5] = (uint32_t)scales[a] | ((uint32_t)scales[b] << 8);
+}
+
+static __device__ __forceinline__ void moe_conv8_q3_K(const moe_raw8 &r, int part, float *out) {
+    const int n = part / 16;
+    const int j = (part % 16) / 4;
+    const int l0 = 8 * (part % 4);
+    const int is = 8 * n + 2 * j + (l0 >= 16 ? 1 : 0);
+    const uint32_t sa = r.w[5] & 0xFF, sb = r.w[5] >> 8;
+    const uint32_t us = is < 4    ? (sa & 0xF) | (((sb >> 0) & 3) << 4)
+                        : is < 8  ? (sa & 0xF) | (((sb >> 2) & 3) << 4)
+                        : is < 12 ? (sa >> 4) | (((sb >> 4) & 3) << 4)
+                                  : (sa >> 4) | (((sb >> 6) & 3) << 4);
+    const float dl = __half2float(__ushort_as_half((uint16_t)r.w[0])) * ((float)us - 32.0f);
+    const int shift = 2 * j;
+    const uint32_t m = 1u << (4 * n + j);
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const uint32_t qword = l < 4 ? r.w[1] : r.w[2];
+        const uint32_t hword = l < 4 ? r.w[3] : r.w[4];
+        const int q = (int)((qword >> (8 * (l % 4) + shift)) & 3);
+        const int h = (int)((hword >> (8 * (l % 4))) & 0xFF);
+        out[l] = dl * (float)(q - ((h & m) ? 0 : 4));
+    }
+}
+
 // Q6_K: 256 weights; ql holds the low four bits, qh the high two, 16 scales of 16 weights.
 // The eight weights of a part share one ql run, one qh run and one scale, read as 16-bit words
 // (210-byte blocks are only 2-byte aligned).

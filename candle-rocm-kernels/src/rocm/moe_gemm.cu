@@ -363,6 +363,7 @@ MOE_GEMM_ALL_DST(q4_0, QK4_0, block_q4_0, moe_load8_q4_0, moe_conv8_q4_0)
 MOE_GEMM_ALL_DST(q5_0, QK5_0, block_q5_0, moe_load8_q5_0, moe_conv8_q5_0)
 MOE_GEMM_ALL_DST(q8_0, QK8_0, block_q8_0, moe_load8_q8_0, moe_conv8_q8_0)
 MOE_GEMM_ALL_DST(q4k, QK_K, block_q4_K, moe_load8_q4_K, moe_conv8_q4_K)
+MOE_GEMM_ALL_DST(q3k, QK_K, block_q3_K, moe_load8_q3_K, moe_conv8_q3_K)
 MOE_GEMM_ALL_DST(q6k, QK_K, block_q6_K, moe_load8_q6_K, moe_conv8_q6_K)
 
 // Writes 1 when this code object has the WMMA kernels above, 0 otherwise.
