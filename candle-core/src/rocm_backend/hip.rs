@@ -229,7 +229,36 @@ struct Staging {
 }
 
 const STAGING_SLOT_BYTES: usize = 256 * 1024;
-const STAGING_SLOTS: usize = 32;
+const STAGING_SLOTS: usize = 128;
+
+/// Pinned buffers for host-to-device copies larger than a staging slot (a prefill chunk's
+/// n-gram rows are tens of megabytes). A copy from pageable memory has to wait for the
+/// stream to drain before the host buffer may be reused, which stalls the host and then
+/// idles the device for the copy and everything launched after it; from pinned memory it
+/// is asynchronous. A buffer is reused once the event recorded after its copy has completed.
+/// `CANDLE_ROCM_LARGE_STAGING=0` disables this path.
+#[derive(Debug, Default)]
+struct LargeStaging {
+    slots: Vec<LargeSlot>,
+    total_bytes: usize,
+}
+
+#[derive(Debug)]
+struct LargeSlot {
+    base: *mut u8,
+    bytes: usize,
+    event: sys::hipEvent_t,
+}
+
+/// Bound on the pinned bytes held for large uploads; beyond it, copies that find no free
+/// buffer wait for one, and copies that fit none take the pageable path.
+const LARGE_STAGING_MAX_TOTAL_BYTES: usize = 256 << 20;
+const LARGE_STAGING_GRANULE: usize = 16 << 20;
+
+fn large_staging_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CANDLE_ROCM_LARGE_STAGING").map_or(true, |v| v != "0"))
+}
 
 impl Staging {
     fn new() -> Result<Self, HipError> {
@@ -316,6 +345,7 @@ pub struct HipStream {
     raw: sys::hipStream_t,
     ordinal: usize,
     staging: std::sync::Mutex<Option<Staging>>,
+    large_staging: std::sync::Mutex<LargeStaging>,
     cache: std::sync::Mutex<BlockCache>,
     /// Counts the operations that may write device memory: allocations, copies,
     /// launches and every hand-out of the raw stream to foreign code.
@@ -365,6 +395,7 @@ impl HipStream {
             raw,
             ordinal,
             staging: std::sync::Mutex::new(Some(staging)),
+            large_staging: std::sync::Mutex::new(LargeStaging::default()),
             cache: std::sync::Mutex::new(BlockCache::default()),
             epoch: std::sync::atomic::AtomicU64::new(0),
             derived: std::sync::Mutex::new(None),
@@ -878,6 +909,11 @@ impl HipStream {
                 return check(unsafe { sys::hipEventRecord(event, self.raw) });
             }
         }
+        if large_staging_enabled()
+            && self.upload_through_large_staging(src.as_ptr() as *const u8, bytes, dst.device_ptr())?
+        {
+            return Ok(());
+        }
         check(unsafe {
             sys::hipMemcpyAsync(
                 dst.device_ptr() as *mut c_void,
@@ -889,6 +925,77 @@ impl HipStream {
         })?;
         // Pageable host memory may still be read after hipMemcpyAsync returns.
         self.synchronize()
+    }
+
+    /// Uploads `bytes` at `src` through a large pinned buffer (see `LargeStaging`); false
+    /// when no buffer can be had, so the caller copies from pageable memory.
+    fn upload_through_large_staging(
+        &self,
+        src: *const u8,
+        bytes: usize,
+        dst: u64,
+    ) -> Result<bool, HipError> {
+        let mut staging = self.large_staging.lock().unwrap();
+        // The smallest buffer that fits and whose last copy has completed; failing that,
+        // the smallest that fits.
+        let mut pick: Option<(usize, bool)> = None;
+        for (i, slot) in staging.slots.iter().enumerate() {
+            if slot.bytes < bytes {
+                continue;
+            }
+            let free = unsafe { sys::hipEventQuery(slot.event) } == sys::hipSuccess;
+            let better = match pick {
+                None => true,
+                Some((p, p_free)) => {
+                    (free && !p_free) || (free == p_free && slot.bytes < staging.slots[p].bytes)
+                }
+            };
+            if better {
+                pick = Some((i, free));
+            }
+        }
+        let idx = match pick {
+            Some((i, true)) => i,
+            other => {
+                let rounded = bytes.div_ceil(LARGE_STAGING_GRANULE) * LARGE_STAGING_GRANULE;
+                if staging.total_bytes + rounded <= LARGE_STAGING_MAX_TOTAL_BYTES {
+                    let mut base = std::ptr::null_mut();
+                    check(unsafe { sys::hipHostMalloc(&mut base, rounded, 0) })?;
+                    let mut event = std::ptr::null_mut();
+                    check(unsafe {
+                        sys::hipEventCreateWithFlags(&mut event, sys::hipEventDisableTiming)
+                    })?;
+                    // Recorded once so the first query of the buffer finds it free.
+                    check(unsafe { sys::hipEventRecord(event, self.raw) })?;
+                    staging.slots.push(LargeSlot {
+                        base: base as *mut u8,
+                        bytes: rounded,
+                        event,
+                    });
+                    staging.total_bytes += rounded;
+                    staging.slots.len() - 1
+                } else if let Some((i, false)) = other {
+                    // Every fitting buffer is still being read; wait for the one picked.
+                    check(unsafe { sys::hipEventSynchronize(staging.slots[i].event) })?;
+                    i
+                } else {
+                    return Ok(false);
+                }
+            }
+        };
+        let slot = &staging.slots[idx];
+        unsafe { std::ptr::copy_nonoverlapping(src, slot.base, bytes) };
+        check(unsafe {
+            sys::hipMemcpyAsync(
+                dst as *mut c_void,
+                slot.base as *const c_void,
+                bytes,
+                sys::hipMemcpyHostToDevice,
+                self.raw,
+            )
+        })?;
+        check(unsafe { sys::hipEventRecord(slot.event, self.raw) })?;
+        Ok(true)
     }
 
     pub fn clone_dtoh<T: DeviceRepr, Src: DevicePtr<T>>(
