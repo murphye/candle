@@ -7,6 +7,7 @@
 //!
 //! Environment variables:
 //! - `ROCM_PATH`: ROCm installation (default `/opt/rocm`).
+//! - `CANDLE_ROCM_HIPCC_FLAGS`: extra hipcc flags, space separated, also exported to dependents.
 //! - `CANDLE_ROCM_ARCHS`: comma separated gfx targets. When unset, the GPUs present
 //!   on the build machine are used, falling back to a list of common targets.
 use std::env;
@@ -44,6 +45,7 @@ fn main() {
     println!("cargo::rerun-if-changed=hip_compat");
     println!("cargo::rerun-if-env-changed=ROCM_PATH");
     println!("cargo::rerun-if-env-changed=CANDLE_ROCM_ARCHS");
+    println!("cargo::rerun-if-env-changed=CANDLE_ROCM_HIPCC_FLAGS");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -73,6 +75,10 @@ fn main() {
     // compatibility headers and targets: DEP_CANDLE_ROCM_KERNELS_{HIP_COMPAT,ARCHS}.
     println!("cargo::metadata=hip_compat={}", compat.display());
     println!("cargo::metadata=archs={}", archs.join(","));
+    // Extra hipcc flags (space separated), forwarded to dependents that compile their own
+    // HIP sources, e.g. `-mllvm -amdgpu-enable-vopd=false` for reproducible code objects.
+    let extra_flags = env::var("CANDLE_ROCM_HIPCC_FLAGS").unwrap_or_default();
+    println!("cargo::metadata=hipcc_flags={extra_flags}");
 
     let jobs: Vec<(String, PathBuf, PathBuf)> = MODULES
         .iter()
@@ -110,6 +116,15 @@ fn main() {
     std::fs::write(out_dir.join("code_objects.rs"), code).unwrap();
 }
 
+/// Extra hipcc flags from `CANDLE_ROCM_HIPCC_FLAGS`, split on whitespace.
+fn extra_hipcc_flags() -> Vec<String> {
+    env::var("CANDLE_ROCM_HIPCC_FLAGS")
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(String::from)
+        .collect()
+}
+
 fn compile(
     hipcc: &Path,
     archs: &[String],
@@ -134,6 +149,7 @@ fn compile(
     for arch in archs {
         cmd.arg(format!("--offload-arch={arch}"));
     }
+    cmd.args(extra_hipcc_flags());
     cmd.arg("-o").arg(out).arg(src);
     let output = cmd
         .output()

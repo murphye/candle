@@ -32,8 +32,13 @@ if [ $# -eq 0 ]; then
 fi
 
 # Forward selected host variables only when they are set.
-env_flags=()
-for var in CARGO_TARGET_DIR CANDLE_ROCM_ARCHS HIP_VISIBLE_DEVICES RUST_BACKTRACE RUST_LOG HF_TOKEN; do
+# HIP_FORCE_DEV_KERNARG=1 (kernel arguments written straight to device memory) measured
+# about 3% faster decode on the R9700s; the host value wins when set.
+env_flags=(-e "HIP_FORCE_DEV_KERNARG=${HIP_FORCE_DEV_KERNARG:-1}")
+# A trapped wave otherwise writes a ~30 GB GPU core dump for ~7 minutes while holding the
+# card; rocgdb attach is the debugging route here.
+env_flags+=(-e "HSA_DISABLE_COREDUMP_ON_EXCEPTION=${HSA_DISABLE_COREDUMP_ON_EXCEPTION:-1}")
+for var in CARGO_TARGET_DIR CANDLE_ROCM_ARCHS CANDLE_ROCM_HIPCC_FLAGS CANDLE_ROCM_BLOCK_CACHE_MB HIP_VISIBLE_DEVICES RUST_BACKTRACE RUST_LOG HF_TOKEN; do
     if [ -n "${!var:-}" ]; then
         env_flags+=(-e "${var}=${!var}")
     fi
