@@ -191,7 +191,11 @@ impl RocmDevice {
             module_name: module_name.to_string(),
         })?;
         ms.insert(module_name.to_string(), module.clone());
-        let func = module.load_function(fn_name).w()?;
+        // A missing symbol names the function: "named symbol not found" alone is not actionable.
+        let func = module.load_function(fn_name).map_err(|hip| RocmError::Load {
+            hip,
+            module_name: format!("{module_name}::{fn_name}"),
+        })?;
         Ok(RocmFunc {
             func,
             stream: self.stream.clone(),
@@ -220,7 +224,11 @@ impl RocmDevice {
                 module
             }
         };
-        let func = module.load_function(fn_name).w()?;
+        // A missing symbol names the function: "named symbol not found" alone is not actionable.
+        let func = module.load_function(fn_name).map_err(|hip| RocmError::Load {
+            hip,
+            module_name: format!("{:?}::{fn_name}", kernels::ALL_IDS[index]),
+        })?;
         ms.funcs[index].insert(fn_name.to_string(), func.clone());
         Ok(RocmFunc {
             func,

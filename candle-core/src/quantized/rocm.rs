@@ -1316,6 +1316,10 @@ impl QRocmStorage {
 
 /// Batch sizes up to this use the q8_1 matrix-vector kernels.
 const MMVQ_MAX_ROWS: usize = 8;
+/// Larger batches are zero-padded to one of these instantiated widths and still use them;
+/// beyond the last, the weights are dequantized for a dense GEMM.
+const MMVQ_PADDED_ROWS: [usize; 4] = [12, 16, 24, 32];
+const MMVQ_PADDED_MAX_ROWS: usize = 32;
 
 fn dequantize_kernel_available(dtype: GgmlDType) -> bool {
     matches!(
@@ -1595,19 +1599,65 @@ impl QRocmStorage {
             [b, k] => (*b, *k),
             _ => return Ok(None),
         };
-        if ncols != k || b_size == 0 || b_size > MMVQ_MAX_ROWS {
+        if ncols != k || b_size == 0 || b_size > MMVQ_PADDED_MAX_ROWS {
             return Ok(None);
         }
         let Some((o1, o2)) = rhs_l.contiguous_offsets() else {
             return Ok(None);
         };
         let dev = self.device();
-        let (dst_tag, rhs_ptr) = match &rhs.slice {
-            S::BF16(s) => ("bf16", s.slice(o1..o2).device_ptr()),
-            S::F16(s) => ("f16", s.slice(o1..o2).device_ptr()),
-            S::F32(s) => ("f32", s.slice(o1..o2).device_ptr()),
-            _ => return Ok(None),
+        // Past the one-launch row limit (speculative verify steps carry 1 + depth rows per
+        // sequence), the rows are zero-padded to the next instantiated kernel width: the
+        // weights are still read once, where dequantizing them for a dense GEMM read them
+        // once more and ran the skinny GEMM at a tenth of the bandwidth.
+        let b_launch = if b_size <= MMVQ_MAX_ROWS {
+            b_size
+        } else {
+            *MMVQ_PADDED_ROWS
+                .iter()
+                .find(|&&rows| rows >= b_size)
+                .expect("b_size <= MMVQ_PADDED_MAX_ROWS")
         };
+        // The padded widths exist for the row-per-wave kernels only (weights with at least
+        // k / 8 rows); the rest keep the dequantized GEMM.
+        if b_size > MMVQ_MAX_ROWS && k > 8 * nrows {
+            return Ok(None);
+        }
+        let mut padded: Option<S> = None;
+        let (dst_tag, rhs_ptr) = if b_launch == b_size {
+            match &rhs.slice {
+                S::BF16(s) => ("bf16", s.slice(o1..o2).device_ptr()),
+                S::F16(s) => ("f16", s.slice(o1..o2).device_ptr()),
+                S::F32(s) => ("f32", s.slice(o1..o2).device_ptr()),
+                _ => return Ok(None),
+            }
+        } else {
+            let (tag, slice, ptr) = match &rhs.slice {
+                S::BF16(s) => {
+                    let mut buf = dev.alloc_zeros::<half::bf16>(b_launch * k)?;
+                    dev.memcpy_dtod(&s.slice(o1..o2), &mut buf.slice_mut(0..b_size * k))?;
+                    let ptr = buf.device_ptr();
+                    ("bf16", S::BF16(buf), ptr)
+                }
+                S::F16(s) => {
+                    let mut buf = dev.alloc_zeros::<f16>(b_launch * k)?;
+                    dev.memcpy_dtod(&s.slice(o1..o2), &mut buf.slice_mut(0..b_size * k))?;
+                    let ptr = buf.device_ptr();
+                    ("f16", S::F16(buf), ptr)
+                }
+                S::F32(s) => {
+                    let mut buf = dev.alloc_zeros::<f32>(b_launch * k)?;
+                    dev.memcpy_dtod(&s.slice(o1..o2), &mut buf.slice_mut(0..b_size * k))?;
+                    let ptr = buf.device_ptr();
+                    ("f32", S::F32(buf), ptr)
+                }
+                _ => return Ok(None),
+            };
+            padded = Some(slice);
+            (tag, ptr)
+        };
+        let _keep_padded = &padded;
+        let b_size = b_launch;
 
         let k_padded = pad(k, MATRIX_ROW_PADDING);
         let shared = SharedQ8Activation::new(dev, rhs_ptr, dst_tag, k, b_size)?;

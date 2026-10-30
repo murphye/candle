@@ -28,7 +28,7 @@ fn quantized_matmul_matches_cpu() -> Result<()> {
         let cpu = QMatMul::from_qtensor(QTensor::quantize(&w, dtype)?)?;
         let gpu = QMatMul::from_qtensor(QTensor::quantize(&w.to_device(&rocm)?, dtype)?)?;
         // Batch sizes on both sides of the MMVQ / dequantize-GEMM switch.
-        for m in [1usize, 3, 8, 9, 64] {
+        for m in [1usize, 3, 8, 9, 24, 64, 65] {
             for act in [DType::F32, DType::BF16, DType::F16] {
                 let x = Tensor::randn(0f32, 1.0, (1, m, k), &Device::Cpu)?.to_dtype(act)?;
                 let expected = cpu.forward(&x.to_dtype(DType::F32)?)?;

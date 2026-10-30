@@ -183,7 +183,11 @@ static __device__ void mmvq_warp_row_multi_q4k_impl(const void *__restrict__ vx,
   MMVQ_WARP_ROW_MULTI_Q4K_ENTRY(dst_tag, dst_c_type, 5)                                                   \
   MMVQ_WARP_ROW_MULTI_Q4K_ENTRY(dst_tag, dst_c_type, 6)                                                   \
   MMVQ_WARP_ROW_MULTI_Q4K_ENTRY(dst_tag, dst_c_type, 7)                                                   \
-  MMVQ_WARP_ROW_MULTI_Q4K_ENTRY(dst_tag, dst_c_type, 8)
+  MMVQ_WARP_ROW_MULTI_Q4K_ENTRY(dst_tag, dst_c_type, 8)                                                   \
+  MMVQ_WARP_ROW_MULTI_Q4K_ENTRY(dst_tag, dst_c_type, 12)                                                  \
+  MMVQ_WARP_ROW_MULTI_Q4K_ENTRY(dst_tag, dst_c_type, 16)                                                  \
+  MMVQ_WARP_ROW_MULTI_Q4K_ENTRY(dst_tag, dst_c_type, 24)                                                  \
+  MMVQ_WARP_ROW_MULTI_Q4K_ENTRY(dst_tag, dst_c_type, 32)
 
 #define MMVQ_WARP_ROW_MULTI_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, dst_tag, dst_c_type, n) \
   extern "C" __global__ void mmvq_gguf_##tag##_##dst_tag##_warp_row##n(                                     \
@@ -200,7 +204,11 @@ static __device__ void mmvq_warp_row_multi_q4k_impl(const void *__restrict__ vx,
   MMVQ_WARP_ROW_MULTI_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, dst_tag, dst_c_type, 5)     \
   MMVQ_WARP_ROW_MULTI_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, dst_tag, dst_c_type, 6)     \
   MMVQ_WARP_ROW_MULTI_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, dst_tag, dst_c_type, 7)     \
-  MMVQ_WARP_ROW_MULTI_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, dst_tag, dst_c_type, 8)
+  MMVQ_WARP_ROW_MULTI_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, dst_tag, dst_c_type, 8)     \
+  MMVQ_WARP_ROW_MULTI_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, dst_tag, dst_c_type, 12)    \
+  MMVQ_WARP_ROW_MULTI_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, dst_tag, dst_c_type, 16)    \
+  MMVQ_WARP_ROW_MULTI_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, dst_tag, dst_c_type, 24)    \
+  MMVQ_WARP_ROW_MULTI_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, dst_tag, dst_c_type, 32)
 
 #define MMVQ_WARP_ROW_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, dst_tag, dst_c_type) \
   extern "C" __global__ void mmvq_gguf_##tag##_##dst_tag##_warp_row(                              \
