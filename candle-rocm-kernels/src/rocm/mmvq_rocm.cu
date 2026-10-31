@@ -456,12 +456,14 @@ static __device__ __forceinline__ void mmq_q4k_scale_min(const uint8_t *q, const
 }
 
 // The workgroup's waves add their partial sums in LDS and wave 0 stores the tile: lane l holds
-// rows 8 * (l / 16) + i of weight row n0 + l % 16.
-template <typename dst_t>
+// rows 8 * (l / 16) + i of weight row n0 + l % 16. A nonzero `act_scale` stores
+// silu(v * act_scale) instead of v.
+template <typename dst_t, int MAX_SPLIT = MMQ_WMMA_MAX_SPLIT>
 static __device__ __forceinline__ void mmq_wmma_finish(float (&acc)[8], dst_t *__restrict__ dst,
                                                        const int n0, const int nrows_x,
-                                                       const int ncols_y) {
-  __shared__ float part[MMQ_WMMA_MAX_SPLIT - 1][8][WARP_SIZE];
+                                                       const int ncols_y,
+                                                       const float act_scale = 0.0f) {
+  __shared__ float part[MAX_SPLIT - 1][8][WARP_SIZE];
   const int lane = threadIdx.x, wave = threadIdx.y;
   if (wave > 0) {
 #pragma unroll
@@ -484,7 +486,12 @@ static __device__ __forceinline__ void mmq_wmma_finish(float (&acc)[8], dst_t *_
   for (int i = 0; i < 8; ++i) {
     const int m = 8 * h + i;
     if (m < ncols_y && n0 + nl < nrows_x) {
-      dst[(size_t)m * nrows_x + n0 + nl] = (dst_t)acc[i];
+      float v = acc[i];
+      if (act_scale != 0.0f) {
+        v *= act_scale;
+        v = v / (1.f + __expf(-v));
+      }
+      dst[(size_t)m * nrows_x + n0 + nl] = (dst_t)v;
     }
   }
 }
@@ -517,15 +524,15 @@ static __device__ __forceinline__ void mmq_load_q8(const block_q8_1 *__restrict_
 }
 #endif
 
-template <typename dst_t>
+template <typename dst_t, int MAX_SPLIT = MMQ_WMMA_MAX_SPLIT>
 static __device__ void mmq_wmma_q4k_impl(const void *__restrict__ vx,
                                          const block_q8_1 *__restrict__ y,
                                          dst_t *__restrict__ dst, const int ncols_x,
                                          const int nrows_x, const int stride_col_y,
-                                         const int ncols_y) {
+                                         const int ncols_y, const int n0 = blockIdx.x * 16,
+                                         const float act_scale = 0.0f) {
 #ifdef MMQ_WMMA_GFX12
   const int lane = threadIdx.x, wave = threadIdx.y, split = blockDim.y;
-  const int n0 = blockIdx.x * 16;
   const int nl = lane & 15, h = lane >> 4;
   // Rows past the matrix read the last row; their results are not stored.
   const int n = min(n0 + nl, nrows_x - 1);
@@ -579,9 +586,10 @@ static __device__ void mmq_wmma_q4k_impl(const void *__restrict__ vx,
       }
     }
   }
-  mmq_wmma_finish(acc, dst, n0, nrows_x, ncols_y);
+  mmq_wmma_finish<dst_t, MAX_SPLIT>(acc, dst, n0, nrows_x, ncols_y, act_scale);
 #else
   (void)vx, (void)y, (void)dst, (void)ncols_x, (void)nrows_x, (void)stride_col_y, (void)ncols_y;
+  (void)n0, (void)act_scale;
 #endif
 }
 
@@ -591,15 +599,15 @@ static __device__ void mmq_wmma_q4k_impl(const void *__restrict__ vx,
 // e of a super-block (half p = e / 128, quarter g = e % 128 / 32, l = e % 32) is the nibble g / 2
 // of ql[64p + 32(g % 2) + l] with bits 2g of qh[32p + l] above it, minus 32, times scales[8p +
 // 2g + l / 16].
-template <typename dst_t>
+template <typename dst_t, int MAX_SPLIT = MMQ_WMMA_MAX_SPLIT>
 static __device__ void mmq_wmma_q6k_impl(const void *__restrict__ vx,
                                          const block_q8_1 *__restrict__ y,
                                          dst_t *__restrict__ dst, const int ncols_x,
                                          const int nrows_x, const int stride_col_y,
-                                         const int ncols_y) {
+                                         const int ncols_y, const int n0 = blockIdx.x * 16,
+                                         const float act_scale = 0.0f) {
 #ifdef MMQ_WMMA_GFX12
   const int lane = threadIdx.x, wave = threadIdx.y, split = blockDim.y;
-  const int n0 = blockIdx.x * 16;
   const int nl = lane & 15, h = lane >> 4;
   const int n = min(n0 + nl, nrows_x - 1);
   const int nb = ncols_x / QK_K;
@@ -646,23 +654,24 @@ static __device__ void mmq_wmma_q6k_impl(const void *__restrict__ vx,
       }
     }
   }
-  mmq_wmma_finish(acc, dst, n0, nrows_x, ncols_y);
+  mmq_wmma_finish<dst_t, MAX_SPLIT>(acc, dst, n0, nrows_x, ncols_y, act_scale);
 #else
   (void)vx, (void)y, (void)dst, (void)ncols_x, (void)nrows_x, (void)stride_col_y, (void)ncols_y;
+  (void)n0, (void)act_scale;
 #endif
 }
 
 // Q5_0: element t of a 32-element block is nibble t / 16 of qs[t % 16] with bit t of qh above
 // it, minus 16, times d. Blocks are 22 bytes, so their fields are read in 16-bit pieces.
-template <typename dst_t>
+template <typename dst_t, int MAX_SPLIT = MMQ_WMMA_MAX_SPLIT>
 static __device__ void mmq_wmma_q5_0_impl(const void *__restrict__ vx,
                                           const block_q8_1 *__restrict__ y,
                                           dst_t *__restrict__ dst, const int ncols_x,
                                           const int nrows_x, const int stride_col_y,
-                                          const int ncols_y) {
+                                          const int ncols_y, const int n0 = blockIdx.x * 16,
+                                          const float act_scale = 0.0f) {
 #ifdef MMQ_WMMA_GFX12
   const int lane = threadIdx.x, wave = threadIdx.y, split = blockDim.y;
-  const int n0 = blockIdx.x * 16;
   const int nl = lane & 15, h = lane >> 4;
   const int n = min(n0 + nl, nrows_x - 1);
   const int nb = ncols_x / QK5_0;
@@ -702,9 +711,10 @@ static __device__ void mmq_wmma_q5_0_impl(const void *__restrict__ vx,
       acc[i] = fmaf((float)dd[i], da * d, acc[i]);
     }
   }
-  mmq_wmma_finish(acc, dst, n0, nrows_x, ncols_y);
+  mmq_wmma_finish<dst_t, MAX_SPLIT>(acc, dst, n0, nrows_x, ncols_y, act_scale);
 #else
   (void)vx, (void)y, (void)dst, (void)ncols_x, (void)nrows_x, (void)stride_col_y, (void)ncols_y;
+  (void)n0, (void)act_scale;
 #endif
 }
 
@@ -733,3 +743,52 @@ MMQ_WMMA_Q4K_ENTRY(f32, float)
   MMQ_WMMA_ENTRY(tag, impl, f32, float)
 MMQ_WMMA_SET(q6_k, mmq_wmma_q6k_impl)
 MMQ_WMMA_SET(q5_0, mmq_wmma_q5_0_impl)
+
+// Weight formats of mmq_wmma_pair, by the code the host passes.
+#define MMQ_WMMA_T_Q4_K 0
+#define MMQ_WMMA_T_Q6_K 1
+#define MMQ_WMMA_T_Q5_0 2
+#define MMQ_WMMA_PAIR_SPLIT 16
+
+template <int MAX_SPLIT>
+static __device__ __forceinline__ void mmq_wmma_typed(const int t, const void *__restrict__ vx,
+                                                      const block_q8_1 *__restrict__ y,
+                                                      __nv_bfloat16 *__restrict__ dst,
+                                                      const int ncols_x, const int nrows_x,
+                                                      const int stride_col_y, const int ncols_y,
+                                                      const int n0, const float act_scale) {
+  switch (t) {
+  case MMQ_WMMA_T_Q4_K:
+    mmq_wmma_q4k_impl<__nv_bfloat16, MAX_SPLIT>(vx, y, dst, ncols_x, nrows_x, stride_col_y,
+                                                ncols_y, n0, act_scale);
+    break;
+  case MMQ_WMMA_T_Q6_K:
+    mmq_wmma_q6k_impl<__nv_bfloat16, MAX_SPLIT>(vx, y, dst, ncols_x, nrows_x, stride_col_y,
+                                                ncols_y, n0, act_scale);
+    break;
+  default:
+    mmq_wmma_q5_0_impl<__nv_bfloat16, MAX_SPLIT>(vx, y, dst, ncols_x, nrows_x, stride_col_y,
+                                                 ncols_y, n0, act_scale);
+    break;
+  }
+}
+
+// y1 = act(x . w1^T) ([ncols_y, r1]) and y2 = x . w2^T ([ncols_y, r2]) over the same q8_1
+// activations in one launch: workgroups 0 .. ceil(r1 / 16) - 1 take w1's 16-row tiles, the rest
+// w2's. act1 nonzero stores silu(v * act1). Up to MMQ_WMMA_PAIR_SPLIT waves split K, since the
+// two matrices together give few tiles (a hyper-connection mixer's down and inject projections).
+extern "C" __global__ void __launch_bounds__(WARP_SIZE * MMQ_WMMA_PAIR_SPLIT)
+    mmq_wmma_pair_bf16(const void *__restrict__ w1, const int t1, const int r1, const float act1,
+                       __nv_bfloat16 *__restrict__ y1, const void *__restrict__ w2, const int t2,
+                       const int r2, __nv_bfloat16 *__restrict__ y2, const void *__restrict__ vy,
+                       const int ncols_x, const int stride_col_y, const int ncols_y) {
+  const int tiles1 = (r1 + 15) / 16;
+  const block_q8_1 *y = (const block_q8_1 *)vy;
+  if ((int)blockIdx.x < tiles1) {
+    mmq_wmma_typed<MMQ_WMMA_PAIR_SPLIT>(t1, w1, y, y1, ncols_x, r1, stride_col_y, ncols_y,
+                                        blockIdx.x * 16, act1);
+  } else {
+    mmq_wmma_typed<MMQ_WMMA_PAIR_SPLIT>(t2, w2, y, y2, ncols_x, r2, stride_col_y, ncols_y,
+                                        (blockIdx.x - tiles1) * 16, 0.0f);
+  }
+}

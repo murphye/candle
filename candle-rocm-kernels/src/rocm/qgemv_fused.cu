@@ -333,7 +333,7 @@ QG_PAIR_FIXED(qgemv_pair_bf16_k10240_q6k_q4k, QG_Q6_K, QG_Q4_K, 5)
 // per workgroup. With Q8 the workgroup's 32 columns form one q8_1 block per batch row, written
 // to `q8` in the layout of mmvq_gguf_quantize_q8_1 (`nblocks = hidden / 32` blocks per row),
 // so the matmuls that consume the mixed activations skip their quantize launch.
-template <int T, int GROUPS, int ITERS, int WARPS, bool Q8>
+template <int T, int GROUPS, int ITERS, int WARPS, bool Q8, int MAX_ROWS = QGEMV_MAX_ROWS>
 __device__ __forceinline__ void qgemv_gate_mean_fixed(const __nv_bfloat16 *__restrict__ lo, const int m,
                                                       const void *__restrict__ w,
                                                       const __nv_bfloat16 *__restrict__ xn, const int hidden,
@@ -345,6 +345,16 @@ __device__ __forceinline__ void qgemv_gate_mean_fixed(const __nv_bfloat16 *__res
   const int lane = threadIdx.x % 32;
   const int warp = threadIdx.x / 32;
   const int h = blockIdx.x * WARPS + warp;
+  // Every wave, and each of its GROUPS lane groups, reads all of lo; past 8 rows those reads
+  // from cache cost more than the weights, so the wide variants stage lo in LDS once.
+  constexpr bool STAGE = MAX_ROWS > QGEMV_MAX_ROWS;
+  __shared__ __attribute__((aligned(16))) __nv_bfloat16 lo_s[STAGE ? MAX_ROWS * k : 8];
+  if constexpr (STAGE) {
+    for (int i = threadIdx.x * 8; i < m * k; i += blockDim.x * 8) {
+      *reinterpret_cast<uint4 *>(lo_s + i) = *reinterpret_cast<const uint4 *>(lo + i);
+    }
+    __syncthreads();
+  }
   if constexpr (!Q8) {
     if (h >= hidden) {
       return;
@@ -358,14 +368,18 @@ __device__ __forceinline__ void qgemv_gate_mean_fixed(const __nv_bfloat16 *__res
   for (int i = 0; i < ITERS; ++i) {
     qg_dequant8_t<T>(w, k / qk, row, sub + i * per, wv[i]);
   }
-  float acc[QGEMV_MAX_ROWS] = {};
+  float acc[MAX_ROWS] = {};
 #pragma unroll
-  for (int b = 0; b < QGEMV_MAX_ROWS; ++b) {
+  for (int b = 0; b < MAX_ROWS; ++b) {
     if (b < m) {
       float xv[ITERS][8];
 #pragma unroll
       for (int i = 0; i < ITERS; ++i) {
-        qg_load8(lo + (int64_t)b * k + (sub + i * per) * 8, xv[i]);
+        if constexpr (STAGE) {
+          qg_load8(lo_s + b * k + (sub + i * per) * 8, xv[i]);
+        } else {
+          qg_load8(lo + (int64_t)b * k + (sub + i * per) * 8, xv[i]);
+        }
       }
 #pragma unroll
       for (int i = 0; i < ITERS; ++i) {
@@ -378,9 +392,9 @@ __device__ __forceinline__ void qgemv_gate_mean_fixed(const __nv_bfloat16 *__res
       }
     }
   }
-  float mix[QGEMV_MAX_ROWS] = {};
+  float mix[MAX_ROWS] = {};
 #pragma unroll
-  for (int b = 0; b < QGEMV_MAX_ROWS; ++b) {
+  for (int b = 0; b < MAX_ROWS; ++b) {
     if (b < m) {
       float v = acc[b];
       for (int off = per / 2; off > 0; off >>= 1) {
@@ -397,7 +411,7 @@ __device__ __forceinline__ void qgemv_gate_mean_fixed(const __nv_bfloat16 *__res
     }
   }
 #pragma unroll
-  for (int b = 0; b < QGEMV_MAX_ROWS; ++b) {
+  for (int b = 0; b < MAX_ROWS; ++b) {
     if (b < m && lane == b) {
       out[(int64_t)b * hidden + h] = __float2bfloat16(mix[b] / GROUPS);
     }
@@ -406,9 +420,9 @@ __device__ __forceinline__ void qgemv_gate_mean_fixed(const __nv_bfloat16 *__res
     // Quantize this workgroup's 32 columns (one block per batch row) from the stored bf16
     // values, so the result equals a quantize launch over `out`.
     static_assert(WARPS == 32, "the q8 variant quantizes one 32-column block per workgroup");
-    __shared__ float cols[QGEMV_MAX_ROWS][32];
+    __shared__ float cols[MAX_ROWS][32];
 #pragma unroll
-    for (int b = 0; b < QGEMV_MAX_ROWS; ++b) {
+    for (int b = 0; b < MAX_ROWS; ++b) {
       if (b < m && lane == 0) {
         cols[b][warp] = __bfloat162float(__float2bfloat16(mix[b] / GROUPS));
       }
@@ -434,7 +448,8 @@ __device__ __forceinline__ void qgemv_gate_mean_fixed(const __nv_bfloat16 *__res
   }
 }
 
-// Same signature as qgemv_gate_mean_bf16; `k`, `t` and `groups` are fixed by the name.
+// Same signature as qgemv_gate_mean_bf16; `k`, `t` and `groups` are fixed by the name. The _r16
+// variants take up to 16 batch rows (a speculative verify step over three or four sequences).
 #define QG_GATE_MEAN_FIXED(NAME, T, GROUPS, ITERS)                                                 \
   extern "C" __global__ void __launch_bounds__(QG_GATE_WARPS * 32) NAME(                           \
       const __nv_bfloat16 *__restrict__ lo, const int m, const int k, const void *__restrict__ w,   \
@@ -449,5 +464,130 @@ __device__ __forceinline__ void qgemv_gate_mean_fixed(const __nv_bfloat16 *__res
       __nv_bfloat16 *__restrict__ out, void *__restrict__ q8) {                                    \
     qgemv_gate_mean_fixed<T, GROUPS, ITERS, 32, true>(lo, m, w, xn, hidden, out,                   \
                                                        (block_q8_1 *)q8);                          \
+  }                                                                                                \
+  extern "C" __global__ void __launch_bounds__(QG_GATE_WARPS * 32) NAME##_r16(                     \
+      const __nv_bfloat16 *__restrict__ lo, const int m, const int k, const void *__restrict__ w,   \
+      const int t, const __nv_bfloat16 *__restrict__ xn, const int groups, const int hidden,       \
+      __nv_bfloat16 *__restrict__ out) {                                                           \
+    qgemv_gate_mean_fixed<T, GROUPS, ITERS, QG_GATE_WARPS, false, 16>(lo, m, w, xn, hidden, out,   \
+                                                                       nullptr);                   \
+  }                                                                                                \
+  extern "C" __global__ void __launch_bounds__(1024) NAME##_q8_r16(                                \
+      const __nv_bfloat16 *__restrict__ lo, const int m, const int k, const void *__restrict__ w,   \
+      const int t, const __nv_bfloat16 *__restrict__ xn, const int groups, const int hidden,       \
+      __nv_bfloat16 *__restrict__ out, void *__restrict__ q8) {                                    \
+    qgemv_gate_mean_fixed<T, GROUPS, ITERS, 32, true, 16>(lo, m, w, xn, hidden, out,               \
+                                                           (block_q8_1 *)q8);                      \
   }
 QG_GATE_MEAN_FIXED(qgemv_gate_mean_bf16_k320_g4_q5_0, QG_Q5_0, 4, 5)
+
+// qgemv_gate_mean_bf16_k320_g4_q5_0 for 9-16 batch rows on gfx12 WMMA, where the per-row dot
+// products of the scalar kernels dominate: the gate projection is a [16, 320] x [320, 4 * hidden]
+// product. A workgroup of eight waves owns 32 output columns; wave w computes stream w / 2's
+// 16 x 16 gate tile at columns 16 (w % 2) of them, with lo staged in LDS as f16 and the Q5_0
+// weights dequantized to f16 per 16-wide step (A lane l: row l % 16, k 8h .. 8h + 7; B lane l:
+// column l % 16, the same k; D lane l: column l % 16, rows 8h .. 8h + 7). The streams' gated
+// values meet in LDS for the mean. With Q8 the 32 columns form one q8_1 block per batch row.
+#if defined(__gfx1200__) || defined(__gfx1201__)
+#define QG_WMMA_GFX12 1
+typedef _Float16 qg_h8 __attribute__((ext_vector_type(8)));
+typedef float qg_f8 __attribute__((ext_vector_type(8)));
+#endif
+#define QGW_K 320
+#define QGW_GROUPS 4
+
+template <bool Q8>
+__device__ __forceinline__ void qgemv_gate_mean_wmma_q5_0(const __nv_bfloat16 *__restrict__ lo, const int m,
+                                                          const void *__restrict__ w,
+                                                          const __nv_bfloat16 *__restrict__ xn,
+                                                          const int hidden, __nv_bfloat16 *__restrict__ out,
+                                                          block_q8_1 *__restrict__ q8) {
+#ifdef QG_WMMA_GFX12
+  __shared__ __attribute__((aligned(16))) _Float16 lo_s[16 * QGW_K];
+  __shared__ float gated[QGW_GROUPS][16][32];
+  const int lane = threadIdx.x % 32, wave = threadIdx.x / 32;
+  const int h = lane >> 4, col = lane & 15;
+  for (int i = threadIdx.x; i < 16 * QGW_K; i += blockDim.x) {
+    lo_s[i] = i < m * QGW_K ? (_Float16)__bfloat162float(lo[i]) : (_Float16)0.f;
+  }
+  __syncthreads();
+  const int s = wave >> 1, ct = wave & 1;
+  const int c0 = blockIdx.x * 32 + ct * 16;
+  const block_q5_0 *wr = (const block_q5_0 *)w + ((int64_t)s * hidden + c0 + col) * (QGW_K / 32);
+  qg_f8 d = {};
+#pragma unroll
+  for (int st = 0; st < QGW_K / 16; ++st) {
+    const qg_h8 a = *reinterpret_cast<const qg_h8 *>(lo_s + col * QGW_K + st * 16 + 8 * h);
+    // Element t of a block is nibble t / 16 of qs[t % 16] with bit t of qh above it, minus 16:
+    // this step's elements are 16 (st % 2) + 8h + e.
+    const block_q5_0 *bq = wr + st / 2;
+    const int hi = st % 2;
+    const uint16_t *qh16 = (const uint16_t *)bq->qh;
+    const uint32_t qh = ((uint32_t)qh16[0] | ((uint32_t)qh16[1] << 16)) >> (16 * hi + 8 * h);
+    const float dd = __half2float(*(const half *)&bq->d);
+    qg_h8 b;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      const int q = ((bq->qs[8 * h + e] >> (4 * hi)) & 0xF) | (((qh >> e) & 1) << 4);
+      b[e] = (_Float16)(dd * (float)(q - 16));
+    }
+    d = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, d);
+  }
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int b = 8 * h + i;
+    gated[s][b][ct * 16 + col] =
+        b < m ? __bfloat162float(xn[(int64_t)b * QGW_GROUPS * hidden + (int64_t)s * hidden + c0 + col]) /
+                    (1.f + __expf(-d[i]))
+              : 0.f;
+  }
+  __syncthreads();
+  for (int o = threadIdx.x; o < 16 * 32; o += blockDim.x) {
+    const int b = o / 32, c = o % 32;
+    if (b < m) {
+      const __nv_bfloat16 v = __float2bfloat16(
+          (gated[0][b][c] + gated[1][b][c] + gated[2][b][c] + gated[3][b][c]) / QGW_GROUPS);
+      out[(int64_t)b * hidden + blockIdx.x * 32 + c] = v;
+      // Only this thread reads (b, c): it can hold the stored value for the quantization.
+      gated[0][b][c] = __bfloat162float(v);
+    }
+  }
+  if constexpr (Q8) {
+    // As qgemv_gate_mean_fixed: quantize the stored bf16 values, one block per batch row.
+    __syncthreads();
+    for (int b = wave; b < m; b += 8) {
+      const float xi = gated[0][b][lane];
+      float amax = fabsf(xi);
+      float sum = xi;
+      for (int off = 16; off > 0; off >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off, 32));
+        sum += __shfl_xor_sync(0xffffffff, sum, off, 32);
+      }
+      const float dq = amax / 127.0f;
+      block_q8_1 *blk = q8 + (size_t)b * (hidden / 32) + blockIdx.x;
+      blk->qs[lane] = amax == 0.0f ? 0 : (int8_t)roundf(xi / dq);
+      if (lane == 0) {
+        reinterpret_cast<half &>(blk->ds.x) = (half)dq;
+        reinterpret_cast<half &>(blk->ds.y) = (half)sum;
+      }
+    }
+  }
+#else
+  (void)lo, (void)m, (void)w, (void)xn, (void)hidden, (void)out, (void)q8;
+#endif
+}
+
+// Same signatures as qgemv_gate_mean_bf16_k320_g4_q5_0(_q8); 256 threads, hidden / 32 workgroups.
+extern "C" __global__ void __launch_bounds__(256) qgemv_gate_mean_bf16_k320_g4_q5_0_wmma(
+    const __nv_bfloat16 *__restrict__ lo, const int m, const int k, const void *__restrict__ w,
+    const int t, const __nv_bfloat16 *__restrict__ xn, const int groups, const int hidden,
+    __nv_bfloat16 *__restrict__ out) {
+  qgemv_gate_mean_wmma_q5_0<false>(lo, m, w, xn, hidden, out, nullptr);
+}
+extern "C" __global__ void __launch_bounds__(256) qgemv_gate_mean_bf16_k320_g4_q5_0_q8_wmma(
+    const __nv_bfloat16 *__restrict__ lo, const int m, const int k, const void *__restrict__ w,
+    const int t, const __nv_bfloat16 *__restrict__ xn, const int groups, const int hidden,
+    __nv_bfloat16 *__restrict__ out, void *__restrict__ q8) {
+  qgemv_gate_mean_wmma_q5_0<true>(lo, m, w, xn, hidden, out, (block_q8_1 *)q8);
+}
+

@@ -2249,16 +2249,24 @@ fn fused_weight_code(dtype: GgmlDType) -> Option<i32> {
 }
 
 const FUSED_MAX_ROWS: usize = 8;
+/// Rows the 16-row variants of the fused kernels (and the WMMA pair) take.
+const FUSED_WIDE_MAX_ROWS: usize = 16;
+/// Waves per workgroup splitting K at most in `mmq_wmma_pair_bf16` (`MMQ_WMMA_PAIR_SPLIT`).
+const MMQ_WMMA_PAIR_SPLIT: usize = 16;
 
-/// `[rows, k]` of a contiguous bf16 activation matrix on `device`, and its device address, when
-/// the fused kernels take it.
-fn fused_activation(x: &crate::Tensor, device: &RocmDevice) -> Result<Option<(usize, usize, u64)>> {
+/// `[rows, k]` of a contiguous bf16 activation matrix on `device` with at most `max_rows` rows,
+/// and its device address, when the fused kernels take it.
+fn fused_activation(
+    x: &crate::Tensor,
+    device: &RocmDevice,
+    max_rows: usize,
+) -> Result<Option<(usize, usize, u64)>> {
     if x.dtype() != crate::DType::BF16 || !x.is_contiguous() {
         return Ok(None);
     }
     let k = x.dim(crate::D::Minus1)?;
     let rows = x.elem_count() / k.max(1);
-    if rows == 0 || rows > FUSED_MAX_ROWS {
+    if rows == 0 || rows > max_rows {
         return Ok(None);
     }
     let (storage, layout) = x.storage_and_layout();
@@ -2287,10 +2295,13 @@ pub fn qgemv_pair(
     let crate::Device::Rocm(device) = x.device() else {
         return Ok(None);
     };
+    if let Some(out) = qgemv_pair_wmma(x, device, w1, silu_scale1, w2)? {
+        return Ok(Some(out));
+    }
     let (Some(t1), Some(t2)) = (fused_weight_code(w1.dtype()), fused_weight_code(w2.dtype())) else {
         return Ok(None);
     };
-    let Some((rows, k, x_ptr)) = fused_activation(x, device)? else {
+    let Some((rows, k, x_ptr)) = fused_activation(x, device, FUSED_MAX_ROWS)? else {
         return Ok(None);
     };
     let (Ok((r1, k1)), Ok((r2, k2))) = (w1.shape().dims2(), w2.shape().dims2()) else {
@@ -2355,6 +2366,91 @@ pub fn qgemv_pair(
     Ok(Some((wrap(y1, r1), wrap(y2, r2))))
 }
 
+/// [`qgemv_pair`] for `FUSED_MAX_ROWS + 1 ..= FUSED_WIDE_MAX_ROWS` rows, where the bf16 kernel
+/// would re-read every row's activations once per output row: the activations' q8_1 form
+/// (shared with the matmuls around it) and one int8 WMMA launch over both matrices.
+fn qgemv_pair_wmma(
+    x: &crate::Tensor,
+    device: &RocmDevice,
+    w1: &super::QTensor,
+    silu_scale1: Option<f32>,
+    w2: &super::QTensor,
+) -> Result<Option<(crate::Tensor, crate::Tensor)>> {
+    // `MMQ_WMMA_T_*` in mmvq_rocm.cu.
+    let code = |dtype| match dtype {
+        GgmlDType::Q4K => Some(0i32),
+        GgmlDType::Q6K => Some(1),
+        GgmlDType::Q5_0 => Some(2),
+        _ => None,
+    };
+    let (Some(t1), Some(t2)) = (code(w1.dtype()), code(w2.dtype())) else {
+        return Ok(None);
+    };
+    if !mmq_wmma_enabled() || !mmq_wmma_available(device)? {
+        return Ok(None);
+    }
+    let Some((rows, k, x_ptr)) = fused_activation(x, device, FUSED_WIDE_MAX_ROWS)? else {
+        return Ok(None);
+    };
+    let (Ok((r1, k1)), Ok((r2, k2))) = (w1.shape().dims2(), w2.shape().dims2()) else {
+        return Ok(None);
+    };
+    if rows <= FUSED_MAX_ROWS
+        || k1 != k
+        || k2 != k
+        || k % w1.dtype().block_size() != 0
+        || k % w2.dtype().block_size() != 0
+    {
+        return Ok(None);
+    }
+    let shared = SharedQ8Activation::new(device, x_ptr, "bf16", k, rows)?;
+    let y1 = unsafe { device.alloc::<half::bf16>(rows * r1)? };
+    let y2 = unsafe { device.alloc::<half::bf16>(rows * r2)? };
+    let tiles = r1.div_ceil(16) + r2.div_ceil(16);
+    let blocks_k = (k / w1.dtype().block_size()).min(k / w2.dtype().block_size());
+    let mut split = 1;
+    while split < MMQ_WMMA_PAIR_SPLIT
+        && tiles * split < MMQ_WMMA_TARGET_WAVES
+        && split * 2 <= blocks_k
+    {
+        split *= 2;
+    }
+    let func = device.get_or_load_func("mmq_wmma_pair_bf16", &kernels::MMVQ)?;
+    let (w1_ptr, w2_ptr) = (w1.device_ptr()? as u64, w2.device_ptr()? as u64);
+    let act1 = silu_scale1.unwrap_or(0.0);
+    let stride_col_y = (pad(k, MATRIX_ROW_PADDING) / GgmlDType::Q8_1.block_size()) as i32;
+    let mut builder = func.builder();
+    builder.arg(&w1_ptr);
+    barg!(builder, t1, r1 as i32, act1);
+    builder.arg(&y1);
+    builder.arg(&w2_ptr);
+    barg!(builder, t2, r2 as i32);
+    builder.arg(&y2);
+    builder.arg(&shared.ptr);
+    barg!(builder, k as i32, stride_col_y, rows as i32);
+    let cfg = LaunchConfig {
+        grid_dim: (tiles as u32, 1, 1),
+        block_dim: (WARP_SIZE as u32, split as u32, 1),
+        shared_mem_bytes: 0,
+    };
+    // SAFETY: ffi; shapes, formats and alignment were checked above.
+    unsafe { builder.launch(cfg) }.w()?;
+    shared.keep();
+    let mut lead = x.dims().to_vec();
+    lead.pop();
+    let wrap = |slice, n: usize| {
+        let mut dims = lead.clone();
+        dims.push(n);
+        crate::Tensor::from_storage(
+            crate::Storage::Rocm(RocmStorage::wrap_rocm_slice(slice, device.clone())),
+            dims,
+            crate::op::BackpropOp::none(),
+            false,
+        )
+    };
+    Ok(Some((wrap(y1, r1), wrap(y2, r2))))
+}
+
 /// `mean_s xn[.., s * hidden + h] * sigmoid(lo . w[s * hidden + h])` over `groups` streams,
 /// for up to 4 streams:
 /// the gate projection of bf16 `lo: [.., k]` through GGUF `w: [groups * hidden, k]` and the gated
@@ -2395,9 +2491,10 @@ fn qgemv_gate_mean_impl(
     let Some(t) = fused_weight_code(w.dtype()) else {
         return Ok(None);
     };
-    let (Some((rows, k, lo_ptr)), Some((xn_rows, width, xn_ptr))) =
-        (fused_activation(lo, device)?, fused_activation(xn, device)?)
-    else {
+    let (Some((rows, k, lo_ptr)), Some((xn_rows, width, xn_ptr))) = (
+        fused_activation(lo, device, FUSED_WIDE_MAX_ROWS)?,
+        fused_activation(xn, device, FUSED_WIDE_MAX_ROWS)?,
+    ) else {
         return Ok(None);
     };
     let Ok((w_rows, w_k)) = w.shape().dims2() else {
@@ -2417,6 +2514,11 @@ fn qgemv_gate_mean_impl(
         (320, 4, GgmlDType::Q5_0) => Some("qgemv_gate_mean_bf16_k320_g4_q5_0"),
         _ => None,
     };
+    // Past 8 rows only the specialized kernels have (16-row) variants.
+    let wide = rows > FUSED_MAX_ROWS;
+    if wide && specialized.is_none() {
+        return Ok(None);
+    }
     // The q8 variant needs the padded q8_1 row (MATRIX_ROW_PADDING) to equal the plain one.
     let seed_q8 = seed_q8 && specialized.is_some() && hidden % MATRIX_ROW_PADDING == 0;
     let q8 = if seed_q8 {
@@ -2429,6 +2531,14 @@ fn qgemv_gate_mean_impl(
         (Some(name), true) => format!("{name}_q8"),
         (Some(name), false) => name.to_string(),
         (None, _) => "qgemv_gate_mean_bf16".to_string(),
+    };
+    // Past 8 rows the WMMA variant (gfx12) beats the scalar dot products; 32 columns per
+    // workgroup.
+    let wmma = wide && hidden % 32 == 0 && mmq_wmma_enabled() && mmq_wmma_available(device)?;
+    let name = match (wide, wmma) {
+        (true, true) => format!("{name}_wmma"),
+        (true, false) => format!("{name}_r16"),
+        _ => name,
     };
     let func = device.get_or_load_func(&name, &kernels::QGEMV_FUSED)?;
     let w_ptr = w.device_ptr()? as u64;
@@ -2446,10 +2556,14 @@ fn qgemv_gate_mean_impl(
     if let Some(q8) = &q8 {
         builder.arg(q8);
     }
-    let warps = if seed_q8 { 32 } else { 8 };
+    let (columns, threads) = match (wmma, seed_q8) {
+        (true, _) => (32, 256),
+        (false, true) => (32, 1024),
+        (false, false) => (8, 256),
+    };
     let cfg = LaunchConfig {
-        grid_dim: (hidden.div_ceil(warps) as u32, 1, 1),
-        block_dim: ((warps * 32) as u32, 1, 1),
+        grid_dim: (hidden.div_ceil(columns) as u32, 1, 1),
+        block_dim: (threads as u32, 1, 1),
         shared_mem_bytes: 0,
     };
     // SAFETY: ffi; shapes, formats and alignment were checked above.
