@@ -1325,6 +1325,47 @@ const MMVQ_PADDED_MAX_ROWS: usize = 32;
 /// Waves per row in the split-K kernels (`MMVQ_SPLITK_WAVES` in mmvq_rocm.cu).
 const MMVQ_SPLITK_WAVES: u32 = 4;
 
+/// Q4_K batches of these many activation rows use the int8 WMMA GEMM on gfx12
+/// (`mmq_wmma_q4_k_*`): from 4 rows it beats the dp4a kernels on every trunk shape (1.1-1.6x at
+/// 4 rows, 2-3.8x at 16 on 2x R9700 per-rank shapes), which are VALU-bound past a few rows.
+const MMQ_WMMA_MIN_ROWS: usize = 4;
+const MMQ_WMMA_MAX_ROWS: usize = 16;
+/// Waves per workgroup splitting K at most (`MMQ_WMMA_MAX_SPLIT` in mmvq_rocm.cu).
+const MMQ_WMMA_MAX_SPLIT: usize = 8;
+/// K is split until a launch has this many waves: 16-row weight tiles alone leave the GPU
+/// mostly idle below ~10K rows.
+const MMQ_WMMA_TARGET_WAVES: usize = 640;
+
+/// `CANDLE_ROCM_MMQ_WMMA=0` keeps Q4_K batches on the dp4a kernels.
+fn mmq_wmma_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CANDLE_ROCM_MMQ_WMMA").map_or(true, |v| v != "0"))
+}
+
+/// Whether `dev`'s code object carries the int8 WMMA GEMM (gfx12).
+fn mmq_wmma_available(dev: &RocmDevice) -> Result<bool> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static AVAILABLE: OnceLock<Mutex<HashMap<usize, bool>>> = OnceLock::new();
+    let cache = AVAILABLE.get_or_init(Default::default);
+    if let Some(&known) = cache.lock().unwrap().get(&dev.ordinal()) {
+        return Ok(known);
+    }
+    let flag = dev.alloc_zeros::<i32>(1)?;
+    let func = dev.get_or_load_func("mmq_wmma_available", &kernels::MMVQ)?;
+    let mut builder = func.builder();
+    builder.arg(&flag);
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe { builder.launch(cfg) }.w()?;
+    let known = dev.clone_dtoh(&flag)?[0] == 1;
+    cache.lock().unwrap().insert(dev.ordinal(), known);
+    Ok(known)
+}
+
 /// `CANDLE_ROCM_MMVQ_SPLITK=0` sends padded batches on few-row weights back to dequantize + GEMM.
 fn mmvq_splitk_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1606,6 +1647,78 @@ fn mmvq_tag(dtype: GgmlDType) -> Option<&'static str> {
 }
 
 impl QRocmStorage {
+    /// Q4_K weights times `b_size` (`MMQ_WMMA_MIN_ROWS..=MMQ_WMMA_MAX_ROWS`) activation rows on
+    /// the int8 WMMA: one 16-row weight tile per workgroup, K split across its waves.
+    fn mmq_wmma_q4k(
+        &self,
+        rhs: &RocmStorage,
+        rhs_l: &crate::Layout,
+        (o1, o2): (usize, usize),
+        b_size: usize,
+        k: usize,
+        nrows: usize,
+    ) -> Result<Option<(RocmStorage, crate::Shape)>> {
+        use crate::backend::BackendStorage;
+        use crate::rocm_backend::RocmStorageSlice as S;
+        let dev = self.device();
+        let (dst_tag, rhs_ptr) = match &rhs.slice {
+            S::BF16(s) => ("bf16", s.slice(o1..o2).device_ptr()),
+            S::F16(s) => ("f16", s.slice(o1..o2).device_ptr()),
+            S::F32(s) => ("f32", s.slice(o1..o2).device_ptr()),
+            _ => return Ok(None),
+        };
+        let k_padded = pad(k, MATRIX_ROW_PADDING);
+        let shared = SharedQ8Activation::new(dev, rhs_ptr, dst_tag, k, b_size)?;
+        let y_q8_1 = shared.ptr;
+        let out = match rhs.dtype() {
+            crate::DType::BF16 => S::BF16(unsafe { dev.alloc::<half::bf16>(nrows * b_size)? }),
+            crate::DType::F16 => S::F16(unsafe { dev.alloc::<f16>(nrows * b_size)? }),
+            _ => S::F32(unsafe { dev.alloc::<f32>(nrows * b_size)? }),
+        };
+        let out_ptr = match &out {
+            S::BF16(s) => s.device_ptr(),
+            S::F16(s) => s.device_ptr(),
+            S::F32(s) => s.device_ptr(),
+            _ => unreachable!(),
+        };
+        let tiles = nrows.div_ceil(16);
+        let blocks_k = k / GgmlDType::Q4K.block_size();
+        let mut split = 1;
+        while split < MMQ_WMMA_MAX_SPLIT
+            && tiles * split < MMQ_WMMA_TARGET_WAVES
+            && split * 2 <= blocks_k
+        {
+            split *= 2;
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (tiles as u32, 1, 1),
+            block_dim: (WARP_SIZE as u32, split as u32, 1),
+            shared_mem_bytes: 0,
+        };
+        let func =
+            dev.get_or_load_func_keyed(("mmq_wmma", "q4_k", dst_tag), 0, &kernels::MMVQ, || {
+                format!("mmq_wmma_q4_k_{dst_tag}")
+            })?;
+        let stride_col_y = (k_padded / GgmlDType::Q8_1.block_size()) as i32;
+        let mut builder = func.builder();
+        builder.arg(&self.data.inner);
+        builder.arg(&y_q8_1);
+        builder.arg(&out_ptr);
+        barg!(builder, k as i32, nrows as i32, stride_col_y, b_size as i32);
+        unsafe { builder.launch(cfg) }.w()?;
+        shared.keep();
+        let mut out_shape = rhs_l.shape().dims().to_vec();
+        out_shape.pop();
+        out_shape.push(nrows);
+        Ok(Some((
+            RocmStorage {
+                slice: out,
+                device: dev.clone(),
+            },
+            out_shape.into(),
+        )))
+    }
+
     /// Matrix-vector product for batches of up to `MMVQ_MAX_ROWS` rows with the
     /// mmvq_gguf kernels, which read and write the activation dtype directly.
     /// Returns `None` when the inputs are not supported.
@@ -1633,6 +1746,13 @@ impl QRocmStorage {
             return Ok(None);
         };
         let dev = self.device();
+        if self.dtype == GgmlDType::Q4K
+            && (MMQ_WMMA_MIN_ROWS..=MMQ_WMMA_MAX_ROWS).contains(&b_size)
+            && mmq_wmma_enabled()
+            && mmq_wmma_available(dev)?
+        {
+            return self.mmq_wmma_q4k(rhs, rhs_l, (o1, o2), b_size, k, nrows);
+        }
         // Past the one-launch row limit (speculative verify steps carry 1 + depth rows per
         // sequence), the rows are zero-padded to the next instantiated kernel width: the
         // weights are still read once, where dequantizing them for a dense GEMM read them

@@ -61,7 +61,13 @@ fn few_row_weights_at_verify_widths_match_cpu() -> Result<()> {
         ] {
             let cpu = QMatMul::from_qtensor(QTensor::quantize(&w, dtype)?)?;
             let gpu = QMatMul::from_qtensor(QTensor::quantize(&w.to_device(&rocm)?, dtype)?)?;
-            for m in [9usize, 12, 13, 16, 24, 32] {
+            // Four rows reach Q4_K's int8 WMMA GEMM; the split-K kernels start at nine.
+            let rows: &[usize] = if dtype == GgmlDType::Q4K {
+                &[4, 9, 12, 13, 16, 24, 32]
+            } else {
+                &[9, 12, 13, 16, 24, 32]
+            };
+            for &m in rows {
                 for act in [DType::BF16, DType::F32] {
                     let x = Tensor::randn(0f32, 1.0, (1, m, k), &Device::Cpu)?.to_dtype(act)?;
                     let expected = cpu.forward(&x.to_dtype(DType::F32)?)?;
@@ -94,7 +100,8 @@ fn verify_widths_on_trunk_shapes_match_cpu() -> Result<()> {
         ] {
             let cpu = QMatMul::from_qtensor(QTensor::quantize(&w, dtype)?)?;
             let gpu = QMatMul::from_qtensor(QTensor::quantize(&w.to_device(&rocm)?, dtype)?)?;
-            for m in [9usize, 12, 16, 17, 24, 32] {
+            // 4-16 rows of Q4_K take the int8 WMMA GEMM on gfx12.
+            for m in [4usize, 5, 8, 9, 12, 16, 17, 24, 32] {
                 let x = Tensor::randn(0f32, 1.0, (1, m, k), &Device::Cpu)?.to_dtype(DType::BF16)?;
                 let expected = cpu.forward(&x.to_dtype(DType::F32)?)?;
                 let got = gpu.forward(&x.to_device(&rocm)?)?;
