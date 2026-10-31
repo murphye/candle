@@ -117,6 +117,7 @@ extern "C" {
         attr: hipMemPoolAttr,
         value: *mut c_void,
     ) -> hipError_t;
+    pub fn hipMemPoolTrimTo(pool: hipMemPool_t, min_bytes_to_hold: usize) -> hipError_t;
     pub fn hipHostMalloc(ptr: *mut *mut c_void, size: usize, flags: c_uint) -> hipError_t;
     pub fn hipHostFree(ptr: *mut c_void) -> hipError_t;
     pub fn hipMallocAsync(ptr: *mut *mut c_void, size: usize, stream: hipStream_t) -> hipError_t;

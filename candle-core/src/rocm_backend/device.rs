@@ -130,6 +130,11 @@ impl RocmDevice {
         self.stream.clone()
     }
 
+    /// Returns memory cached for reuse to the driver; see [`HipStream::trim_memory`].
+    pub fn trim_memory(&self) -> Result<()> {
+        self.stream.trim_memory().w()
+    }
+
     /// Starts capturing this device's work into a graph; see [`HipStream::begin_capture`].
     pub fn begin_capture(&self) -> Result<()> {
         self.stream.begin_capture().w()

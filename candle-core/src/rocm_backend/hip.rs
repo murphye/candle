@@ -217,6 +217,15 @@ fn retain_freed_pool_memory(ordinal: usize) -> Result<(), HipError> {
     })
 }
 
+/// Returns the memory the default pool holds unused to the driver, for allocations made
+/// outside the pool (the graph pool's `hipMalloc`): with [`retain_freed_pool_memory`] the
+/// pool otherwise keeps a prefill's peak for good.
+fn trim_default_pool(ordinal: usize) -> Result<(), HipError> {
+    let mut pool = std::ptr::null_mut();
+    check(unsafe { sys::hipDeviceGetDefaultMemPool(&mut pool, ordinal as i32) })?;
+    check(unsafe { sys::hipMemPoolTrimTo(pool, 0) })
+}
+
 /// Pinned host buffers for small host-to-device copies. Copies from pageable
 /// memory have to finish before the source may be reused, which stalls the host
 /// until the stream drains. Staged copies are asynchronous: each slot records an
@@ -569,6 +578,23 @@ impl HipStream {
         self.capturing.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// `hipMalloc` for the graph pool. Out of memory, it retries once with the default pool's
+    /// unused memory returned to the driver (the block cache cannot be emptied mid-capture: its
+    /// frees would be recorded into the graph).
+    fn graph_malloc(&self, block: usize) -> Result<u64, HipError> {
+        self.bind()?;
+        let mut ptr = std::ptr::null_mut();
+        let mut status = unsafe { sys::hipMalloc(&mut ptr, block) };
+        if status == sys::hipErrorOutOfMemory {
+            trim_default_pool(self.ordinal)?;
+            // Clears the failed attempt's sticky error (see `malloc`).
+            unsafe { sys::hipGetLastError() };
+            status = unsafe { sys::hipMalloc(&mut ptr, block) };
+        }
+        check(status)?;
+        Ok(ptr as u64)
+    }
+
     /// A block from the graph pool, allocated outside the stream's order: a stream-ordered
     /// allocation would become a node of the graph being captured.
     fn graph_alloc(&self, block: usize) -> Result<u64, HipError> {
@@ -576,10 +602,7 @@ impl HipStream {
         if let Some(ptr) = pool.free.get_mut(&block).and_then(Vec::pop) {
             return Ok(ptr);
         }
-        self.bind()?;
-        let mut ptr = std::ptr::null_mut();
-        check(unsafe { sys::hipMalloc(&mut ptr, block) })?;
-        let ptr = ptr as u64;
+        let ptr = self.graph_malloc(block)?;
         pool.owned.insert(ptr);
         pool.bytes += block;
         self.has_graph_pool
@@ -589,10 +612,7 @@ impl HipStream {
 
     /// A new graph-pool block for data uploaded during a capture: never reused.
     fn graph_alloc_frozen(&self, block: usize) -> Result<u64, HipError> {
-        self.bind()?;
-        let mut ptr = std::ptr::null_mut();
-        check(unsafe { sys::hipMalloc(&mut ptr, block) })?;
-        let ptr = ptr as u64;
+        let ptr = self.graph_malloc(block)?;
         let mut pool = self.graph_pool.lock().unwrap();
         pool.owned.insert(ptr);
         pool.frozen.insert(ptr);
@@ -760,6 +780,16 @@ impl HipStream {
         if self.bind().is_ok() {
             unsafe { sys::hipFreeAsync(ptr as *mut c_void, self.raw) };
         }
+    }
+
+    /// Frees the block cache and returns the memory pool's unused memory to the driver, so
+    /// that a graph capture's buffers (allocated outside the pool) can use it. Waits for the
+    /// stream; not allowed while capturing.
+    pub fn trim_memory(&self) -> Result<(), HipError> {
+        self.reject_while_capturing()?;
+        self.release_cached()?;
+        self.synchronize()?;
+        trim_default_pool(self.ordinal)
     }
 
     /// Frees every cached block back to the memory pool.
