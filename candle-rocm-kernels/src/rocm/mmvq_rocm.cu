@@ -454,6 +454,67 @@ static __device__ __forceinline__ void mmq_q4k_scale_min(const uint8_t *q, const
     m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
   }
 }
+
+// The workgroup's waves add their partial sums in LDS and wave 0 stores the tile: lane l holds
+// rows 8 * (l / 16) + i of weight row n0 + l % 16.
+template <typename dst_t>
+static __device__ __forceinline__ void mmq_wmma_finish(float (&acc)[8], dst_t *__restrict__ dst,
+                                                       const int n0, const int nrows_x,
+                                                       const int ncols_y) {
+  __shared__ float part[MMQ_WMMA_MAX_SPLIT - 1][8][WARP_SIZE];
+  const int lane = threadIdx.x, wave = threadIdx.y;
+  if (wave > 0) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      part[wave - 1][i][lane] = acc[i];
+    }
+  }
+  __syncthreads();
+  if (wave > 0) {
+    return;
+  }
+  for (int w = 1; w < (int)blockDim.y; ++w) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      acc[i] += part[w - 1][i][lane];
+    }
+  }
+  const int nl = lane & 15, h = lane >> 4;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int m = 8 * h + i;
+    if (m < ncols_y && n0 + nl < nrows_x) {
+      dst[(size_t)m * nrows_x + n0 + nl] = (dst_t)acc[i];
+    }
+  }
+}
+
+// A 32-bit word of a 2-byte-aligned field (Q6_K's 210-byte and Q5_0's 22-byte blocks).
+static __device__ __forceinline__ uint32_t mmq_ld32(const uint8_t *p) {
+  const uint16_t *q = (const uint16_t *)p;
+  return (uint32_t)q[0] | ((uint32_t)q[1] << 16);
+}
+
+// Bytes x - c for bytes x >= c and c < 128: the high bit set first keeps borrows inside each byte.
+static __device__ __forceinline__ uint32_t mmq_sub_bytes(const uint32_t x, const uint32_t c) {
+  return ((x | 0x80808080u) - c) ^ 0x80808080u;
+}
+
+// Loads row m's 8 q8_1 values for this lane's half (h) of each 16-wide step of block `bq`, and
+// the block's (scale, sum).
+static __device__ __forceinline__ void mmq_load_q8(const block_q8_1 *__restrict__ bq, const int h,
+                                                   const bool ok, mmq_v2i &a0, mmq_v2i &a1,
+                                                   uint32_t &ds) {
+  a0 = (mmq_v2i){0, 0};
+  a1 = (mmq_v2i){0, 0};
+  ds = 0;
+  if (ok) {
+    const int *qa = (const int *)(bq->qs + 8 * h);
+    a0 = (mmq_v2i){qa[0], qa[1]};
+    a1 = (mmq_v2i){qa[4], qa[5]};
+    ds = *(const uint32_t *)&bq->ds;
+  }
+}
 #endif
 
 template <typename dst_t>
@@ -463,7 +524,6 @@ static __device__ void mmq_wmma_q4k_impl(const void *__restrict__ vx,
                                          const int nrows_x, const int stride_col_y,
                                          const int ncols_y) {
 #ifdef MMQ_WMMA_GFX12
-  __shared__ float part[MMQ_WMMA_MAX_SPLIT - 1][8][WARP_SIZE];
   const int lane = threadIdx.x, wave = threadIdx.y, split = blockDim.y;
   const int n0 = blockIdx.x * 16;
   const int nl = lane & 15, h = lane >> 4;
@@ -519,29 +579,130 @@ static __device__ void mmq_wmma_q4k_impl(const void *__restrict__ vx,
       }
     }
   }
-  if (wave > 0) {
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      part[wave - 1][i][lane] = acc[i];
-    }
-  }
-  __syncthreads();
-  if (wave > 0) {
-    return;
-  }
-  for (int w = 1; w < split; ++w) {
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      acc[i] += part[w - 1][i][lane];
-    }
-  }
+  mmq_wmma_finish(acc, dst, n0, nrows_x, ncols_y);
+#else
+  (void)vx, (void)y, (void)dst, (void)ncols_x, (void)nrows_x, (void)stride_col_y, (void)ncols_y;
+#endif
+}
+
+
+// Q6_K: a 16-element WMMA step shares one int8 scale, so the two steps of each 32-element
+// activation block are combined in int32 (D0 * sc0 + D1 * sc1) before one f32 scaling. Element
+// e of a super-block (half p = e / 128, quarter g = e % 128 / 32, l = e % 32) is the nibble g / 2
+// of ql[64p + 32(g % 2) + l] with bits 2g of qh[32p + l] above it, minus 32, times scales[8p +
+// 2g + l / 16].
+template <typename dst_t>
+static __device__ void mmq_wmma_q6k_impl(const void *__restrict__ vx,
+                                         const block_q8_1 *__restrict__ y,
+                                         dst_t *__restrict__ dst, const int ncols_x,
+                                         const int nrows_x, const int stride_col_y,
+                                         const int ncols_y) {
+#ifdef MMQ_WMMA_GFX12
+  const int lane = threadIdx.x, wave = threadIdx.y, split = blockDim.y;
+  const int n0 = blockIdx.x * 16;
+  const int nl = lane & 15, h = lane >> 4;
+  const int n = min(n0 + nl, nrows_x - 1);
+  const int nb = ncols_x / QK_K;
+  const block_q6_K *wrow = (const block_q6_K *)vx + (size_t)n * nb;
+  const bool m_ok = nl < ncols_y;
+  const block_q8_1 *yrow = y + (size_t)(m_ok ? nl : 0) * stride_col_y;
+  float acc[8];
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
-    const int m = 8 * h + i;
-    if (m < ncols_y && n0 + nl < nrows_x) {
-      dst[(size_t)m * nrows_x + n0 + nl] = (dst_t)acc[i];
+    acc[i] = 0.0f;
+  }
+  for (int kb = wave; kb < nb; kb += split) {
+    const block_q6_K *b = wrow + kb;
+    const float d = __half2float(b->d);
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+      // The high bits of all four quarters of this half: steps s = 0, 1 at byte 16s + 8h.
+      const uint8_t *qh = b->qh + 32 * p + 8 * h;
+      const uint32_t h00 = mmq_ld32(qh), h01 = mmq_ld32(qh + 4);
+      const uint32_t h10 = mmq_ld32(qh + 16), h11 = mmq_ld32(qh + 20);
+#pragma unroll
+      for (int g = 0; g < 4; ++g) {
+        const uint8_t *ql = b->ql + 64 * p + 32 * (g % 2) + 8 * h;
+        const int lsh = 4 * (g / 2), hsh = 2 * g;
+        auto q6 = [&](const uint32_t lo, const uint32_t hi) {
+          return (int)mmq_sub_bytes(((lo >> lsh) & 0x0F0F0F0Fu) | (((hi >> hsh) & 0x03030303u) << 4),
+                                    0x20202020u);
+        };
+        const mmq_v2i b0 = {q6(mmq_ld32(ql), h00), q6(mmq_ld32(ql + 4), h01)};
+        const mmq_v2i b1 = {q6(mmq_ld32(ql + 16), h10), q6(mmq_ld32(ql + 20), h11)};
+        mmq_v2i a0, a1;
+        uint32_t ds;
+        mmq_load_q8(yrow + kb * (QK_K / QK8_1) + 4 * p + g, h, m_ok, a0, a1, ds);
+        const mmq_v8i zero = {0, 0, 0, 0, 0, 0, 0, 0};
+        const mmq_v8i d0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a0, true, b0, zero, false);
+        const mmq_v8i d1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a1, true, b1, zero, false);
+        const int sc0 = b->scales[8 * p + 2 * g], sc1 = b->scales[8 * p + 2 * g + 1];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          const uint32_t o = __shfl(ds, 8 * h + i, WARP_SIZE);
+          const float da = __low2float(*(const half2 *)&o);
+          acc[i] = fmaf((float)(d0[i] * sc0 + d1[i] * sc1), da * d, acc[i]);
+        }
+      }
     }
   }
+  mmq_wmma_finish(acc, dst, n0, nrows_x, ncols_y);
+#else
+  (void)vx, (void)y, (void)dst, (void)ncols_x, (void)nrows_x, (void)stride_col_y, (void)ncols_y;
+#endif
+}
+
+// Q5_0: element t of a 32-element block is nibble t / 16 of qs[t % 16] with bit t of qh above
+// it, minus 16, times d. Blocks are 22 bytes, so their fields are read in 16-bit pieces.
+template <typename dst_t>
+static __device__ void mmq_wmma_q5_0_impl(const void *__restrict__ vx,
+                                          const block_q8_1 *__restrict__ y,
+                                          dst_t *__restrict__ dst, const int ncols_x,
+                                          const int nrows_x, const int stride_col_y,
+                                          const int ncols_y) {
+#ifdef MMQ_WMMA_GFX12
+  const int lane = threadIdx.x, wave = threadIdx.y, split = blockDim.y;
+  const int n0 = blockIdx.x * 16;
+  const int nl = lane & 15, h = lane >> 4;
+  const int n = min(n0 + nl, nrows_x - 1);
+  const int nb = ncols_x / QK5_0;
+  const block_q5_0 *wrow = (const block_q5_0 *)vx + (size_t)n * nb;
+  const bool m_ok = nl < ncols_y;
+  const block_q8_1 *yrow = y + (size_t)(m_ok ? nl : 0) * stride_col_y;
+  float acc[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    acc[i] = 0.0f;
+  }
+  // Spreads the low four bits of x into bit 4 of four bytes.
+  auto spread = [](const uint32_t x) {
+    return ((x & 1u) | ((x & 2u) << 7) | ((x & 4u) << 14) | ((x & 8u) << 21)) << 4;
+  };
+  for (int kb = wave; kb < nb; kb += split) {
+    const block_q5_0 *b = wrow + kb;
+    const uint32_t w0 = mmq_ld32(b->qs + 8 * h), w1 = mmq_ld32(b->qs + 8 * h + 4);
+    const uint32_t qh = mmq_ld32(b->qh);
+    // Step 0 holds elements 8h .. 8h + 7 (low nibbles), step 1 elements 16 + 8h .. (high).
+    const uint32_t hb0 = qh >> (8 * h), hb1 = qh >> (16 + 8 * h);
+    const mmq_v2i b0 = {(int)mmq_sub_bytes((w0 & 0x0F0F0F0Fu) | spread(hb0), 0x10101010u),
+                        (int)mmq_sub_bytes((w1 & 0x0F0F0F0Fu) | spread(hb0 >> 4), 0x10101010u)};
+    const mmq_v2i b1 = {(int)mmq_sub_bytes(((w0 >> 4) & 0x0F0F0F0Fu) | spread(hb1), 0x10101010u),
+                        (int)mmq_sub_bytes(((w1 >> 4) & 0x0F0F0F0Fu) | spread(hb1 >> 4), 0x10101010u)};
+    mmq_v2i a0, a1;
+    uint32_t ds;
+    mmq_load_q8(yrow + kb, h, m_ok, a0, a1, ds);
+    mmq_v8i dd = {0, 0, 0, 0, 0, 0, 0, 0};
+    dd = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a0, true, b0, dd, false);
+    dd = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a1, true, b1, dd, false);
+    const float d = __half2float(b->d);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const uint32_t o = __shfl(ds, 8 * h + i, WARP_SIZE);
+      const float da = __low2float(*(const half2 *)&o);
+      acc[i] = fmaf((float)dd[i], da * d, acc[i]);
+    }
+  }
+  mmq_wmma_finish(acc, dst, n0, nrows_x, ncols_y);
 #else
   (void)vx, (void)y, (void)dst, (void)ncols_x, (void)nrows_x, (void)stride_col_y, (void)ncols_y;
 #endif
@@ -558,3 +719,17 @@ static __device__ void mmq_wmma_q4k_impl(const void *__restrict__ vx,
 MMQ_WMMA_Q4K_ENTRY(bf16, __nv_bfloat16)
 MMQ_WMMA_Q4K_ENTRY(f16, half)
 MMQ_WMMA_Q4K_ENTRY(f32, float)
+
+#define MMQ_WMMA_ENTRY(tag, impl, dst_tag, dst_c_type)                                            \
+  extern "C" __global__ void __launch_bounds__(WARP_SIZE * MMQ_WMMA_MAX_SPLIT)                    \
+      mmq_wmma_##tag##_##dst_tag(const void *__restrict__ vx, const void *__restrict__ vy,        \
+                                 dst_c_type *__restrict__ dst, const int ncols_x,                 \
+                                 const int nrows_x, const int stride_col_y, const int ncols_y) {  \
+    impl<dst_c_type>(vx, (const block_q8_1 *)vy, dst, ncols_x, nrows_x, stride_col_y, ncols_y);  \
+  }
+#define MMQ_WMMA_SET(tag, impl)                                                                    \
+  MMQ_WMMA_ENTRY(tag, impl, bf16, __nv_bfloat16)                                                   \
+  MMQ_WMMA_ENTRY(tag, impl, f16, half)                                                             \
+  MMQ_WMMA_ENTRY(tag, impl, f32, float)
+MMQ_WMMA_SET(q6_k, mmq_wmma_q6k_impl)
+MMQ_WMMA_SET(q5_0, mmq_wmma_q5_0_impl)

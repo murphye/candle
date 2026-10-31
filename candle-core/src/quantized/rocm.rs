@@ -1325,8 +1325,8 @@ const MMVQ_PADDED_MAX_ROWS: usize = 32;
 /// Waves per row in the split-K kernels (`MMVQ_SPLITK_WAVES` in mmvq_rocm.cu).
 const MMVQ_SPLITK_WAVES: u32 = 4;
 
-/// Q4_K batches of these many activation rows use the int8 WMMA GEMM on gfx12
-/// (`mmq_wmma_q4_k_*`): from 4 rows it beats the dp4a kernels on every trunk shape (1.1-1.6x at
+/// Q4_K, Q6_K and Q5_0 batches of these many activation rows use the int8 WMMA GEMM on gfx12
+/// (`mmq_wmma_*`): from 4 rows Q4_K beats the dp4a kernels on every trunk shape (1.1-1.6x at
 /// 4 rows, 2-3.8x at 16 on 2x R9700 per-rank shapes), which are VALU-bound past a few rows.
 const MMQ_WMMA_MIN_ROWS: usize = 4;
 const MMQ_WMMA_MAX_ROWS: usize = 16;
@@ -1336,7 +1336,17 @@ const MMQ_WMMA_MAX_SPLIT: usize = 8;
 /// mostly idle below ~10K rows.
 const MMQ_WMMA_TARGET_WAVES: usize = 640;
 
-/// `CANDLE_ROCM_MMQ_WMMA=0` keeps Q4_K batches on the dp4a kernels.
+/// The int8 WMMA GEMM's kernel tag for a weight type (`mmq_wmma_{tag}_*` in mmvq_rocm.cu).
+fn mmq_wmma_tag(dtype: GgmlDType) -> Option<&'static str> {
+    Some(match dtype {
+        GgmlDType::Q4K => "q4_k",
+        GgmlDType::Q6K => "q6_k",
+        GgmlDType::Q5_0 => "q5_0",
+        _ => return None,
+    })
+}
+
+/// `CANDLE_ROCM_MMQ_WMMA=0` keeps these batches on the dp4a kernels.
 fn mmq_wmma_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("CANDLE_ROCM_MMQ_WMMA").map_or(true, |v| v != "0"))
@@ -1647,10 +1657,13 @@ fn mmvq_tag(dtype: GgmlDType) -> Option<&'static str> {
 }
 
 impl QRocmStorage {
-    /// Q4_K weights times `b_size` (`MMQ_WMMA_MIN_ROWS..=MMQ_WMMA_MAX_ROWS`) activation rows on
-    /// the int8 WMMA: one 16-row weight tile per workgroup, K split across its waves.
-    fn mmq_wmma_q4k(
+    /// Weights of `tag`'s type times `b_size` (`MMQ_WMMA_MIN_ROWS..=MMQ_WMMA_MAX_ROWS`)
+    /// activation rows on the int8 WMMA: one 16-row weight tile per workgroup, K split across its
+    /// waves.
+    #[allow(clippy::too_many_arguments)]
+    fn mmq_wmma(
         &self,
+        tag: &'static str,
         rhs: &RocmStorage,
         rhs_l: &crate::Layout,
         (o1, o2): (usize, usize),
@@ -1682,7 +1695,7 @@ impl QRocmStorage {
             _ => unreachable!(),
         };
         let tiles = nrows.div_ceil(16);
-        let blocks_k = k / GgmlDType::Q4K.block_size();
+        let blocks_k = k / self.dtype.block_size();
         let mut split = 1;
         while split < MMQ_WMMA_MAX_SPLIT
             && tiles * split < MMQ_WMMA_TARGET_WAVES
@@ -1696,8 +1709,8 @@ impl QRocmStorage {
             shared_mem_bytes: 0,
         };
         let func =
-            dev.get_or_load_func_keyed(("mmq_wmma", "q4_k", dst_tag), 0, &kernels::MMVQ, || {
-                format!("mmq_wmma_q4_k_{dst_tag}")
+            dev.get_or_load_func_keyed(("mmq_wmma", tag, dst_tag), 0, &kernels::MMVQ, || {
+                format!("mmq_wmma_{tag}_{dst_tag}")
             })?;
         let stride_col_y = (k_padded / GgmlDType::Q8_1.block_size()) as i32;
         let mut builder = func.builder();
@@ -1746,12 +1759,13 @@ impl QRocmStorage {
             return Ok(None);
         };
         let dev = self.device();
-        if self.dtype == GgmlDType::Q4K
-            && (MMQ_WMMA_MIN_ROWS..=MMQ_WMMA_MAX_ROWS).contains(&b_size)
-            && mmq_wmma_enabled()
-            && mmq_wmma_available(dev)?
-        {
-            return self.mmq_wmma_q4k(rhs, rhs_l, (o1, o2), b_size, k, nrows);
+        if let Some(wmma_tag) = mmq_wmma_tag(self.dtype) {
+            if (MMQ_WMMA_MIN_ROWS..=MMQ_WMMA_MAX_ROWS).contains(&b_size)
+                && mmq_wmma_enabled()
+                && mmq_wmma_available(dev)?
+            {
+                return self.mmq_wmma(wmma_tag, rhs, rhs_l, (o1, o2), b_size, k, nrows);
+            }
         }
         // Past the one-launch row limit (speculative verify steps carry 1 + depth rows per
         // sequence), the rows are zero-padded to the next instantiated kernel width: the

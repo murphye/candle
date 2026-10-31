@@ -19,6 +19,8 @@ fn main() -> Result<()> {
         ("qsa o", 2560, 3072, GgmlDType::Q4K),
         ("shexp up", 640, 2560, GgmlDType::Q4K),
         ("shexp down", 2560, 640, GgmlDType::Q8_0),
+        ("q5_0 6144", 6144, 2560, GgmlDType::Q5_0),
+        ("q5_0 2560", 2560, 3072, GgmlDType::Q5_0),
         ("lm head/2", 124160, 2560, GgmlDType::Q6K),
         // Few-row weights (k > 8 * rows): the split-K kernels at verify widths.
         ("hc gate", 4, 10240, GgmlDType::Q8_0),
